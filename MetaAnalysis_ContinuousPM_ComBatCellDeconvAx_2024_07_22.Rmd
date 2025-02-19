@@ -1,0 +1,1518 @@
+---
+title: "Meta-Analysis Results - Continuous PM, ComBat and Cell Deconvolution-Corrected Analyses"
+author: "Gillian Goobie"
+date: "2024_07_22"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+  bookdown::html_document2:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=F}
+library(tidyverse)
+library(readxl)
+library(sesame)
+library(sesameData)
+library(parallel)
+library(here)
+library(SummarizedExperiment)
+library(knitr)
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(writexl)
+library(EpiDISH)
+library(qgcomp)
+library(fuzzySim)
+library(qqman)
+library(ggrepel)
+library(data.table)
+```
+
+
+# PM5yr Meta-Analysis
+## Upload METAL Results for PM5yr Analysis
+```{r}
+outfile1 <- here("MAResults_PM5yr_ComBatAx_2024_07_22.csv")
+PM5yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+PM5yr <- PM5yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+PM5yr <- PM5yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(PM5yr)
+```
+
+## Arrange PM5yr by P-value
+```{r}
+PM5yr <- PM5yr %>% dplyr::arrange(meta_pval)
+```
+
+# Upload Simmons Results for Annotation
+```{r}
+outfile2 <- here("SimmonsAdjusted_ContinuousPM5yrPreSamp_ComBatCellDeconvAx_2024_07_17.csv")
+anno <- read_csv(outfile2)
+```
+
+```{r}
+#restrict to only relevant annotation columns for now
+anno <- anno %>% dplyr::select(Name, chr, pos, strand, UCSC_RefGene_Group, GencodeBasicV12_NAME)
+
+#rename columns
+anno <- anno %>% rename("Name"="CpG", "UCSC_RefGene_Group"="UCSCfeature", "GencodeBasicV12_NAME"="gene")
+
+str(anno)
+```
+
+## Simplify Gene names in annotation
+```{r}
+simple.gene = function(gene.vec)
+  lapply(gene.vec, function(x) paste(unique(strsplit(x, ';')[[1]]), collapse = ';'))
+```
+
+```{r}
+anno$gene <- simple.gene(anno$gene)
+```
+
+## Simplify UCSC feature names in annotation
+```{r}
+anno$UCSCfeature <- simple.gene(anno$UCSCfeature)
+```
+
+
+
+## Merge anno and PM5yr
+```{r}
+PM5yr <- left_join(PM5yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+PM5yrFDR <- PM5yr %>% dplyr::select(CpG, meta_pval)
+PM5yrFDR <- FDR(data=PM5yrFDR, pvalues=PM5yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigPM5yr <- PM5yrFDR$select
+sigPM5yr <- rownames_to_column(sigPM5yr)
+sigPM5yr <- sigPM5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigPM5yr <- PM5yrFDR$exclude
+nonsigPM5yr <- rownames_to_column(nonsigPM5yr)
+nonsigPM5yr <- nonsigPM5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+PM5yrFDR <- rbind(sigPM5yr, nonsigPM5yr)
+```
+
+Merge PM5yrFDR with PM5yr
+```{r}
+PM5yr <- left_join(PM5yr, PM5yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(PM5yr$adjpval <= 0.05)
+sum(PM5yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(PM5yr, "ProcessedMAResults_PM5yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## PM5yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(PM5yr$CpG)
+```
+
+```{r}
+PM5yr_manhattan <- PM5yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in PM5yr_manhattan to match the function's expected names
+names(PM5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+PM5yr_manhattan$CHR <- as.numeric(sub("chr", "", PM5yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified PM5yr_manhattan dataframe
+gg.manhattan(PM5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+Show top 10 CpGs:
+```{r}
+head(PM5yr_manhattan)
+```
+
+
+QQ Plot
+```{r}
+qq(PM5yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- PM5yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.45
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(PM5yr$meta_pval)
+```
+Mean p-value=0.44
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigPM5yr, PM5yr, PM5yrFDR, sigPM5yr, PM5yr_manhattan)
+```
+
+
+
+
+
+# SO45yr Meta-Analysis
+## Upload METAL Results for SO45yr Analysis
+```{r}
+outfile1 <- here("MAResults_SO45yr_ComBatAx_2024_07_22.csv")
+SO45yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+SO45yr <- SO45yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+SO45yr <- SO45yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(SO45yr)
+```
+
+## Arrange SO45yr by P-value
+```{r} 
+SO45yr <- SO45yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and SO45yr
+```{r}
+SO45yr <- left_join(SO45yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+SO45yrFDR <- SO45yr %>% dplyr::select(CpG, meta_pval)
+SO45yrFDR <- FDR(data=SO45yrFDR, pvalues=SO45yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigSO45yr <- SO45yrFDR$select
+sigSO45yr <- rownames_to_column(sigSO45yr)
+sigSO45yr <- sigSO45yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There is 1 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigSO45yr <- SO45yrFDR$exclude
+nonsigSO45yr <- rownames_to_column(nonsigSO45yr)
+nonsigSO45yr <- nonsigSO45yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+SO45yrFDR <- rbind(sigSO45yr, nonsigSO45yr)
+```
+
+Merge SO45yrFDR with SO45yr
+```{r}
+SO45yr <- left_join(SO45yr, SO45yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(SO45yr$adjpval <= 0.05)
+sum(SO45yr$adjpval > 0.05)
+```
+There is 1 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(SO45yr, "ProcessedMAResults_SO45yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## SO45yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=-log10(1e-07),
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(SO45yr$CpG)
+```
+
+```{r}
+SO45yr_manhattan <- SO45yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in SO45yr_manhattan to match the function's expected names
+names(SO45yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+SO45yr_manhattan$CHR <- as.numeric(sub("chr", "", SO45yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified SO45yr_manhattan dataframe
+gg.manhattan(SO45yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+Show top 10 CpGs:
+```{r}
+head(SO45yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(SO45yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- SO45yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.48
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(SO45yr$meta_pval)
+```
+Mean p-value=0.44
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigSO45yr, SO45yr, SO45yrFDR, sigSO45yr, SO45yr_manhattan)
+```
+
+
+
+
+
+# NO35yr Meta-Analysis
+## Upload METAL Results for NO35yr Analysis
+```{r}
+outfile1 <- here("MAResults_NO35yr_ComBatAx_2024_07_22.csv")
+NO35yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+NO35yr <- NO35yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+NO35yr <- NO35yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(NO35yr)
+```
+
+## Arrange NO35yr by P-value
+```{r} 
+NO35yr <- NO35yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and NO35yr
+```{r}
+NO35yr <- left_join(NO35yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+NO35yrFDR <- NO35yr %>% dplyr::select(CpG, meta_pval)
+NO35yrFDR <- FDR(data=NO35yrFDR, pvalues=NO35yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigNO35yr <- NO35yrFDR$select
+sigNO35yr <- rownames_to_column(sigNO35yr)
+sigNO35yr <- sigNO35yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigNO35yr <- NO35yrFDR$exclude
+nonsigNO35yr <- rownames_to_column(nonsigNO35yr)
+nonsigNO35yr <- nonsigNO35yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+NO35yrFDR <- rbind(sigNO35yr, nonsigNO35yr)
+```
+
+Merge NO35yrFDR with NO35yr
+```{r}
+NO35yr <- left_join(NO35yr, NO35yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(NO35yr$adjpval <= 0.05)
+sum(NO35yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(NO35yr, "ProcessedMAResults_NO35yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## NO35yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(NO35yr$CpG)
+```
+
+```{r}
+NO35yr_manhattan <- NO35yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in NO35yr_manhattan to match the function's expected names
+names(NO35yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+NO35yr_manhattan$CHR <- as.numeric(sub("chr", "", NO35yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified NO35yr_manhattan dataframe
+gg.manhattan(NO35yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(NO35yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(NO35yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- NO35yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 0.97
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(NO35yr$meta_pval)
+```
+Mean p-value=0.50
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigNO35yr, NO35yr, NO35yrFDR, sigNO35yr, NO35yr_manhattan)
+```
+
+
+
+
+
+# NH45yr Meta-Analysis
+## Upload METAL Results for NH45yr Analysis
+```{r}
+outfile1 <- here("MAResults_NH45yr_ComBatAx_2024_07_22.csv")
+NH45yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+NH45yr <- NH45yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+NH45yr <- NH45yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(NH45yr)
+```
+
+## Arrange NH45yr by P-value
+```{r} 
+NH45yr <- NH45yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and NH45yr
+```{r}
+NH45yr <- left_join(NH45yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+NH45yrFDR <- NH45yr %>% dplyr::select(CpG, meta_pval)
+NH45yrFDR <- FDR(data=NH45yrFDR, pvalues=NH45yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigNH45yr <- NH45yrFDR$select
+sigNH45yr <- rownames_to_column(sigNH45yr)
+sigNH45yr <- sigNH45yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigNH45yr <- NH45yrFDR$exclude
+nonsigNH45yr <- rownames_to_column(nonsigNH45yr)
+nonsigNH45yr <- nonsigNH45yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+NH45yrFDR <- rbind(sigNH45yr, nonsigNH45yr)
+```
+
+Merge NH45yrFDR with NH45yr
+```{r}
+NH45yr <- left_join(NH45yr, NH45yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(NH45yr$adjpval <= 0.05)
+sum(NH45yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(NH45yr, "ProcessedMAResults_NH45yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## NH45yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(NH45yr$CpG)
+```
+
+```{r}
+NH45yr_manhattan <- NH45yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in NH45yr_manhattan to match the function's expected names
+names(NH45yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+NH45yr_manhattan$CHR <- as.numeric(sub("chr", "", NH45yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified NH45yr_manhattan dataframe
+gg.manhattan(NH45yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(NH45yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(NH45yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- NH45yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.52
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(NH45yr$meta_pval)
+```
+Mean p-value=0.43
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigNH45yr, NH45yr, NH45yrFDR, sigNH45yr, NH45yr_manhattan)
+```
+
+
+
+
+
+
+# BC5yr Meta-Analysis
+## Upload METAL Results for BC5yr Analysis
+```{r}
+outfile1 <- here("MAResults_BC5yr_ComBatAx_2024_07_22.csv")
+BC5yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+BC5yr <- BC5yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+BC5yr <- BC5yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(BC5yr)
+```
+
+## Arrange BC5yr by P-value
+```{r} 
+BC5yr <- BC5yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and BC5yr
+```{r}
+BC5yr <- left_join(BC5yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+BC5yrFDR <- BC5yr %>% dplyr::select(CpG, meta_pval)
+BC5yrFDR <- FDR(data=BC5yrFDR, pvalues=BC5yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigBC5yr <- BC5yrFDR$select
+sigBC5yr <- rownames_to_column(sigBC5yr)
+sigBC5yr <- sigBC5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigBC5yr <- BC5yrFDR$exclude
+nonsigBC5yr <- rownames_to_column(nonsigBC5yr)
+nonsigBC5yr <- nonsigBC5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+BC5yrFDR <- rbind(sigBC5yr, nonsigBC5yr)
+```
+
+Merge BC5yrFDR with BC5yr
+```{r}
+BC5yr <- left_join(BC5yr, BC5yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(BC5yr$adjpval <= 0.05)
+sum(BC5yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(BC5yr, "ProcessedMAResults_BC5yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## BC5yr Manhattan Plot
+Using the code from above for the Manhattan plot (doesn't require the FDR line as no sig CpGs)
+```{r}
+SNPlist <- as.list(BC5yr$CpG)
+```
+
+```{r}
+BC5yr_manhattan <- BC5yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in BC5yr_manhattan to match the function's expected names
+names(BC5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+BC5yr_manhattan$CHR <- as.numeric(sub("chr", "", BC5yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified BC5yr_manhattan dataframe
+gg.manhattan(BC5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(BC5yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(BC5yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- BC5yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.27
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(BC5yr$meta_pval)
+```
+Mean p-value=0.48
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigBC5yr, BC5yr, BC5yrFDR, sigBC5yr, BC5yr_manhattan)
+```
+
+
+
+
+
+
+
+# OM5yr Meta-Analysis
+## Upload METAL Results for OM5yr Analysis
+```{r}
+outfile1 <- here("MAResults_OM5yr_ComBatAx_2024_07_22.csv")
+OM5yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+OM5yr <- OM5yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+OM5yr <- OM5yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(OM5yr)
+```
+
+## Arrange OM5yr by P-value
+```{r} 
+OM5yr <- OM5yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and OM5yr
+```{r}
+OM5yr <- left_join(OM5yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+OM5yrFDR <- OM5yr %>% dplyr::select(CpG, meta_pval)
+OM5yrFDR <- FDR(data=OM5yrFDR, pvalues=OM5yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigOM5yr <- OM5yrFDR$select
+sigOM5yr <- rownames_to_column(sigOM5yr)
+sigOM5yr <- sigOM5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigOM5yr <- OM5yrFDR$exclude
+nonsigOM5yr <- rownames_to_column(nonsigOM5yr)
+nonsigOM5yr <- nonsigOM5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+OM5yrFDR <- rbind(sigOM5yr, nonsigOM5yr)
+```
+
+Merge OM5yrFDR with OM5yr
+```{r}
+OM5yr <- left_join(OM5yr, OM5yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(OM5yr$adjpval <= 0.05)
+sum(OM5yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(OM5yr, "ProcessedMAResults_OM5yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## OM5yr Manhattan Plot
+
+```{r}
+SNPlist <- as.list(OM5yr$CpG)
+```
+
+```{r}
+OM5yr_manhattan <- OM5yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in OM5yr_manhattan to match the function's expected names
+names(OM5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+OM5yr_manhattan$CHR <- as.numeric(sub("chr", "", OM5yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified OM5yr_manhattan dataframe
+gg.manhattan(OM5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(OM5yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(OM5yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- OM5yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.10
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(OM5yr$meta_pval)
+```
+Mean p-value=0.49
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigOM5yr, OM5yr, OM5yrFDR, sigOM5yr, OM5yr_manhattan)
+```
+
+
+
+
+
+# SS5yr Meta-Analysis
+## Upload METAL Results for SS5yr Analysis
+```{r}
+outfile1 <- here("MAResults_SS5yr_ComBatAx_2024_07_22.csv")
+SS5yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+SS5yr <- SS5yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+SS5yr <- SS5yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(SS5yr)
+```
+
+## Arrange SS5yr by P-value
+```{r} 
+SS5yr <- SS5yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and SS5yr
+```{r}
+SS5yr <- left_join(SS5yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+SS5yrFDR <- SS5yr %>% dplyr::select(CpG, meta_pval)
+SS5yrFDR <- FDR(data=SS5yrFDR, pvalues=SS5yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigSS5yr <- SS5yrFDR$select
+sigSS5yr <- rownames_to_column(sigSS5yr)
+sigSS5yr <- sigSS5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigSS5yr <- SS5yrFDR$exclude
+nonsigSS5yr <- rownames_to_column(nonsigSS5yr)
+nonsigSS5yr <- nonsigSS5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+SS5yrFDR <- rbind(sigSS5yr, nonsigSS5yr)
+```
+
+Merge SS5yrFDR with SS5yr
+```{r}
+SS5yr <- left_join(SS5yr, SS5yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(SS5yr$adjpval <= 0.05)
+sum(SS5yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(SS5yr, "ProcessedMAResults_SS5yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## SS5yr Manhattan Plot
+
+```{r}
+SNPlist <- as.list(SS5yr$CpG)
+```
+
+```{r}
+SS5yr_manhattan <- SS5yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in SS5yr_manhattan to match the function's expected names
+names(SS5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+SS5yr_manhattan$CHR <- as.numeric(sub("chr", "", SS5yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified SS5yr_manhattan dataframe
+gg.manhattan(SS5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(SS5yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(SS5yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- SS5yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 1.20
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(SS5yr$meta_pval)
+```
+Mean p-value=0.47
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigSS5yr, SS5yr, SS5yrFDR, sigSS5yr, SS5yr_manhattan)
+```
+
+
+
+
+# Soil5yr Meta-Analysis
+## Upload METAL Results for Soil5yr Analysis
+```{r}
+outfile1 <- here("MAResults_Soil5yr_ComBatAx_2024_07_22.csv")
+Soil5yr <- read.csv(outfile1, sep=",", header=TRUE)
+```
+
+
+```{r}
+Soil5yr <- Soil5yr %>% rename("MarkerName"="CpG", "P.value"="meta_pval", "Zscore"="meta_z", "Direction"="meta_direction", "HetISq"="I2", "HetPVal"="hetpval")
+Soil5yr <- Soil5yr %>% dplyr::select(CpG, meta_pval, meta_z, meta_direction, I2, hetpval)
+str(Soil5yr)
+```
+
+## Arrange Soil5yr by P-value
+```{r} 
+Soil5yr <- Soil5yr %>% dplyr::arrange(meta_pval)
+```
+
+## Merge anno and Soil5yr
+```{r}
+Soil5yr <- left_join(Soil5yr, anno, by="CpG")
+```
+
+## Calculate FDR for Meta-Analysis
+```{r}
+Soil5yrFDR <- Soil5yr %>% dplyr::select(CpG, meta_pval)
+Soil5yrFDR <- FDR(data=Soil5yrFDR, pvalues=Soil5yrFDR, q=0.05)
+```
+
+### Determine number of Significant CpGs
+```{r}
+sigSoil5yr <- Soil5yrFDR$select
+sigSoil5yr <- rownames_to_column(sigSoil5yr)
+sigSoil5yr <- sigSoil5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+And Non-Significant CpGs
+```{r}
+nonsigSoil5yr <- Soil5yrFDR$exclude
+nonsigSoil5yr <- rownames_to_column(nonsigSoil5yr)
+nonsigSoil5yr <- nonsigSoil5yr %>% rename("rowname"="CpG", "p.value"="meta_pval", "p.adjusted"="adjpval")
+```
+
+Combine Sig and Non-Sig
+```{r}
+Soil5yrFDR <- rbind(sigSoil5yr, nonsigSoil5yr)
+```
+
+Merge Soil5yrFDR with Soil5yr
+```{r}
+Soil5yr <- left_join(Soil5yr, Soil5yrFDR, by=c("CpG", "meta_pval"))
+```
+
+Significant CpGs
+```{r}
+sum(Soil5yr$adjpval <= 0.05)
+sum(Soil5yr$adjpval > 0.05)
+```
+There are 0 significant CpGs after FDR correction of meta-analysis p-values
+
+## Write Results to Excel File
+```{r, eval=F}
+write_delim(Soil5yr, "ProcessedMAResults_Soil5yr_ComBatAx_2024_07_22.csv", delim=",")
+```
+
+## Soil5yr Manhattan Plot
+
+```{r}
+SNPlist <- as.list(Soil5yr$CpG)
+```
+
+```{r}
+Soil5yr_manhattan <- Soil5yr %>% dplyr::select(chr, pos, meta_pval, CpG, gene) 
+
+# Renaming columns in Soil5yr_manhattan to match the function's expected names
+names(Soil5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+Soil5yr_manhattan$CHR <- as.numeric(sub("chr", "", Soil5yr_manhattan$CHR))
+```
+
+```{r}
+# Running d gg.manhattan with the modified Soil5yr_manhattan dataframe
+gg.manhattan(Soil5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+Show top 10 CpGs:
+```{r}
+head(Soil5yr_manhattan)
+```
+
+QQ Plot
+```{r}
+qq(Soil5yr$meta_pval)
+```
+
+Lambda (Genomic Inflation Factor)
+```{r}
+chisq <- Soil5yr$meta_z^2
+median(chisq)/qchisq(0.5,1)
+```
+Genomic inflation factor of 0.95
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(Soil5yr$meta_pval)
+```
+Mean p-value=0.51
+
+### Remove unnecessary objects to make space
+```{r}
+rm(nonsigSoil5yr, Soil5yr, Soil5yrFDR, sigSoil5yr, Soil5yr_manhattan)
+```
+
+
+
