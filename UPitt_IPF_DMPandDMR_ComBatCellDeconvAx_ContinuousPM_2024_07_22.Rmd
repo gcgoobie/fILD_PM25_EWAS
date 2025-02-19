@@ -1,0 +1,2816 @@
+---
+title: "Simmons IPF Only Cohort DMP and DMR Analysis - ComBat + Cell Deconvolution Ax, Continuous PM2.5"
+author: "Gillian Goobie"
+date: "2024_07_22"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+  bookdown::html_document2:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=F}
+library(tidyverse)
+library(readxl)
+library(sesame)
+library(sesameData)
+library(parallel)
+library(here)
+library(SummarizedExperiment)
+library(knitr)
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(writexl)
+library(EpiDISH)
+library(ChAMP)
+library(doParallel)
+library(psych)
+library(lumi)
+library(data.table)
+library(qqman)
+```
+
+# Load Processed DNAm Data
+"DNAmEPIC_Environment.RData" has all the other files as well as the original bVals and mVals prior to ComBat correction
+```{r}
+load("~/DNAmEPIC/DNAmEPIC_Environment.RData")
+```
+
+Below is loading the ComBat corrected bVals and mVals objects
+```{r}
+load("~/DNAmEPIC/bVals_mVals_FullCohort_PostComBat_PlateArray.RData")
+```
+
+
+# Fix Simmons race based on chart review by Sharon (2023/11/01)
+```{r}
+#First create a dataframe of the patients with race that needs to be fixed. They're all White.
+fix_race <- data.frame(
+  ID=c(8354, 9434, 10526, 13285, 13310, 13619, 13714, 16924, 22220),
+  new_race=rep("W", times=9),
+  new_dich_Race=rep("White", times=9),
+  new_d_Race=rep("White", times=9)
+)
+
+#Next perform the replacement using a left_join
+meta <- meta %>% left_join(fix_race, by="ID") %>% 
+  mutate(
+    race=coalesce(new_race, race),
+    dich_Race=coalesce(new_dich_Race, dich_Race)
+  ) %>% 
+  dplyr::select(-new_race, -new_dich_Race) #drop the temporary columns
+
+targetsx <- targetsx %>% left_join(fix_race, by=c("ID.y"="ID")) %>% 
+  mutate(
+    race=coalesce(new_race, race),
+    dich_Race=coalesce(new_dich_Race, dich_Race),
+    d_Race=coalesce(new_d_Race, d_Race)
+  ) %>% 
+  dplyr::select(-new_race, -new_dich_Race, -new_d_Race) #drop the temporary columns
+```
+
+# ComBat Batch Correction
+## Correct pd file
+The pd file is otherwise known as the Sample_Sheet.csv or "targets" in the DNAmEPIC_Environment.RData. This is the file where the base data from the .idat files is retained that will allow us to look for batch effects.
+
+First we need to define "Sample_Group" based on low vs high PM2.5 in 5yrs pre-sampling
+```{r, eval=F}
+targetsx$Sample_Group <- targetsx$PM5yrSamp_dich
+```
+
+```{r, eval=F}
+#Need to first rename EPIC_ID to Sample_Name to be consistent with formatting required by ComBat
+targets.c <- targetsx %>% rename("EPIC_ID"="Sample_Name", "cohort"="Project")
+colnames(targets.c)
+```
+
+```{r, eval=F}
+targets.c <- targets.c %>% dplyr::select(Sample_Name, Sample_Plate, Sample_Group, Pool_ID, Project, Sample_Well, Array, Slide, Basename)
+targets.c$filename <- NA
+targets.c$PM5yr_dich <- targets.c$Sample_Group
+targets.c$Sample_Group <- 1
+targets.c <- targets.c %>% mutate(across(c("Pool_ID", "Sample_Well", "Array", "filename"), as.factor))
+str(targets.c)
+```
+
+```{r, eval=F}
+targets.c$Sample_Plate <- droplevels(targets.c$Sample_Plate)
+str(targets.c$Sample_Plate)
+```
+
+
+## Check Baseline SVD (Singular Variable Decomposition)
+SVD will detect the number and nature of significant sources of variation in the methylation dataset and is helpful in determining if correction for batch effects is required.
+```{r, eval=F}
+bVals.df <- as.data.frame(bVals)
+champ.SVD(beta=bVals.df, pd=targets.c)
+```
+This suggests that there are likely significant slide and plate batch effects here that should be corrected for.
+
+
+## Batch Correct Plate and Array
+```{r, eval=F}
+mycombat.arrayplate <- champ.runCombat(beta=bVals.df, pd=targets.c, batchname=c("Array", "Sample_Plate"), logitTrans=TRUE)
+```
+
+```{r, eval=F}
+mycombat.arrayplatedf <- as.data.frame(mycombat.arrayplate)
+```
+
+```{r, eval=F}
+champ.SVD(beta=mycombat.arrayplatedf, pd=targets.c)
+```
+
+
+
+## Re-Make bVals Dataframe
+```{r, eval=F}
+bVals <- mycombat.arrayplate
+```
+
+```{r, eval=F}
+#Convert bVals matrix to mVals matrix 
+mVals <- beta2m(bVals)
+```
+
+```{r}
+rm(contMatrix, DMPs, fit, fit2, fix_race, targets.c)
+```
+
+## Save bVals and mVals to R object
+```{r, eval=F}
+save(bVals, mVals, file = "bVals_mVals_FullCohort_PostComBat_PlateArray.RData")
+```
+
+
+# Get rid of CARE-PF samples
+First in targetsx and meta
+```{r}
+targetsx <- targetsx %>% filter(cohort=="Simmons")
+meta <- meta %>% filter(cohort=="Simmons")
+```
+Takes us down to 306 observations.
+
+```{r}
+dim(mVals)
+Simmons_IDs <- targetsx$ID.x
+mVals <- mVals[,Simmons_IDs]
+dim(mVals)
+```
+
+```{r}
+dim(bVals)
+bVals <- bVals[,Simmons_IDs]
+dim(bVals)
+```
+
+# Get rid of non-IPF samples
+```{r}
+targetsx <- targetsx %>% filter(dx=="IPF")
+meta <- meta %>% filter(dx=="IPF")
+```
+Takes us down to 172 observations.
+
+```{r}
+dim(mVals)
+Simmons_IDs <- targetsx$ID.x
+mVals <- mVals[,Simmons_IDs]
+dim(mVals)
+```
+
+```{r}
+dim(bVals)
+bVals <- bVals[,Simmons_IDs]
+dim(bVals)
+```
+
+
+# Making New Dichotomized Cutpoints for PM2.5
+## targetsx - Make Dichotomized PM2.5
+### 5yrs Pre-Sampling
+Will use the Simmons median for these analyses as the previous cutpoints that were shared between the two cohorts in the full cohort analyses often leave 0 patients from Simmons in the high exposure group and 0 patients from Simmons in the low exposure group.
+```{r}
+summary(targetsx$PM_5yrPreSamp)
+targetsx$PM5yrSamp_dich <- cut(targetsx$PM_5yrPreSamp,
+                      breaks=c(0, 12.07, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$PM5yrSamp_dich)
+class(targetsx$PM5yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$PM_3moPreSamp)
+targetsx$PM3moSamp_dich <- cut(targetsx$PM_3moPreSamp,
+                      breaks=c(0, 10.50, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$PM3moSamp_dich)
+class(targetsx$PM3moSamp_dich)
+```
+
+
+# Make New Dichotomized Cut-points for Constituents
+## targetsx - Make Dichotomized SO4
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$SO4_5yrPreSamp)
+targetsx$SO45yrSamp_dich <- cut(targetsx$SO4_5yrPreSamp,
+                      breaks=c(0, 4.17, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$SO45yrSamp_dich)
+class(targetsx$SO45yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$SO4_3moPreSamp)
+targetsx$SO43moSamp_dich <- cut(targetsx$SO4_3moPreSamp,
+                      breaks=c(0, 2.95, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$SO43moSamp_dich)
+class(targetsx$SO43moSamp_dich)
+```
+
+
+
+## targetsx - Make Dichotomized NO3
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$NO3_5yrPreSamp)
+targetsx$NO35yrSamp_dich <- cut(targetsx$NO3_5yrPreSamp,
+                      breaks=c(0, 1.11, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$NO35yrSamp_dich)
+class(targetsx$NO35yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$NO3_3moPreSamp)
+targetsx$NO33moSamp_dich <- cut(targetsx$NO3_3moPreSamp,
+                      breaks=c(0, 1.07, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$NO33moSamp_dich)
+class(targetsx$NO33moSamp_dich)
+```
+
+
+## targetsx - Make Dichotomized NH4
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$NH4_5yrPreSamp)
+targetsx$NH45yrSamp_dich <- cut(targetsx$NH4_5yrPreSamp,
+                      breaks=c(0, 1.61, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$NH45yrSamp_dich)
+class(targetsx$NH45yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$NH4_3moPreSamp)
+targetsx$NH43moSamp_dich <- cut(targetsx$NH4_3moPreSamp,
+                      breaks=c(0, 1.33, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$NH43moSamp_dich)
+class(targetsx$NH43moSamp_dich)
+```
+
+
+## targetsx - Make Dichotomized BC
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$BC_5yrPreSamp)
+targetsx$BC5yrSamp_dich <- cut(targetsx$BC_5yrPreSamp,
+                      breaks=c(0, 0.85, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$BC5yrSamp_dich)
+class(targetsx$BC5yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$BC_3moPreSamp)
+targetsx$BC3moSamp_dich <- cut(targetsx$BC_3moPreSamp,
+                      breaks=c(0, 0.83, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$BC3moSamp_dich)
+class(targetsx$BC3moSamp_dich)
+```
+
+
+## targetsx - Make Dichotomized OM
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$OM_5yrPreSamp)
+targetsx$OM5yrSamp_dich <- cut(targetsx$OM_5yrPreSamp,
+                      breaks=c(0, 3.30, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$OM5yrSamp_dich)
+class(targetsx$OM5yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$OM_3moPreSamp)
+targetsx$OM3moSamp_dich <- cut(targetsx$OM_3moPreSamp,
+                      breaks=c(0, 3.20, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$OM3moSamp_dich)
+class(targetsx$OM3moSamp_dich)
+```
+
+
+## targetsx - Make Dichotomized SS
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$SS_5yrPreSamp)
+targetsx$SS5yrSamp_dich <- cut(targetsx$SS_5yrPreSamp,
+                      breaks=c(0, 0.19, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$SS5yrSamp_dich)
+class(targetsx$SS5yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$SS_3moPreSamp)
+targetsx$SS3moSamp_dich <- cut(targetsx$SS_3moPreSamp,
+                      breaks=c(0, 0.17, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$SS3moSamp_dich)
+class(targetsx$SS3moSamp_dich)
+```
+
+
+## targetsx - Make Dichotomized Soil
+### 5yrs Pre-Sampling
+```{r}
+summary(targetsx$Soil_5yrPreSamp)
+targetsx$Soil5yrSamp_dich <- cut(targetsx$Soil_5yrPreSamp,
+                      breaks=c(0, 0.51, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$Soil5yrSamp_dich)
+class(targetsx$Soil5yrSamp_dich)
+```
+
+
+### 3mo Pre-Sampling
+```{r}
+summary(targetsx$Soil_3moPreSamp)
+targetsx$Soil3moSamp_dich <- cut(targetsx$Soil_3moPreSamp,
+                      breaks=c(0, 0.43, 100),
+                      labels=c("Low", "High"))
+summary(targetsx$Soil3moSamp_dich)
+class(targetsx$Soil3moSamp_dich)
+```
+
+
+# Releveling factor variables in targetsx
+```{r}
+targetsx$EPIC_ID <- as.factor(targetsx$EPIC_ID)
+targetsx$sex <- fct_relevel(targetsx$sex, c("M","F"))
+targetsx$cohort <- fct_relevel(targetsx$cohort, c("Simmons"))
+targetsx$race <- fct_relevel(targetsx$race, c("W","B","A","U"))
+targetsx$dich_Race <- fct_relevel(targetsx$dich_Race, c("White","Non-White"))
+targetsx$smokeHx <- fct_relevel(targetsx$smokeHx, c("Never","Former","Always","Unknown"))
+
+targetsx$dx <- fct_relevel(targetsx$dx, c("IPF"))
+targetsx$dx_group <- fct_relevel(targetsx$dx_group, c("IPF"))
+targetsx$dx_IPF <- fct_relevel(targetsx$dx_IPF, c("IPF"))
+targetsx$PM5yrSamp_dich <- fct_relevel(targetsx$PM5yrSamp_dich, c("Low"))
+targetsx$PM1yrSamp_dich <- fct_relevel(targetsx$PM1yrSamp_dich, c("Low"))
+targetsx$PM6moSamp_dich <- fct_relevel(targetsx$PM6moSamp_dich, c("Low"))
+targetsx$PM3moSamp_dich <- fct_relevel(targetsx$PM3moSamp_dich, c("Low"))
+targetsx$PM1moSamp_dich <- fct_relevel(targetsx$PM1moSamp_dich, c("Low"))
+targetsx$SO45yrSamp_dich <- fct_relevel(targetsx$SO45yrSamp_dich, c("Low"))
+targetsx$SO41yrSamp_dich <- fct_relevel(targetsx$SO41yrSamp_dich, c("Low"))
+targetsx$SO46moSamp_dich <- fct_relevel(targetsx$SO46moSamp_dich, c("Low"))
+targetsx$SO43moSamp_dich <- fct_relevel(targetsx$SO43moSamp_dich, c("Low"))
+targetsx$SO41moSamp_dich <- fct_relevel(targetsx$SO41moSamp_dich, c("Low"))
+targetsx$NO35yrSamp_dich <- fct_relevel(targetsx$NO35yrSamp_dich, c("Low"))
+targetsx$NO31yrSamp_dich <- fct_relevel(targetsx$NO31yrSamp_dich, c("Low"))
+targetsx$NO36moSamp_dich <- fct_relevel(targetsx$NO36moSamp_dich, c("Low"))
+targetsx$NO33moSamp_dich <- fct_relevel(targetsx$NO33moSamp_dich, c("Low"))
+targetsx$NO31moSamp_dich <- fct_relevel(targetsx$NO31moSamp_dich, c("Low"))
+targetsx$NH45yrSamp_dich <- fct_relevel(targetsx$NH45yrSamp_dich, c("Low"))
+targetsx$NH41yrSamp_dich <- fct_relevel(targetsx$NH41yrSamp_dich, c("Low"))
+targetsx$NH46moSamp_dich <- fct_relevel(targetsx$NH46moSamp_dich, c("Low"))
+targetsx$NH43moSamp_dich <- fct_relevel(targetsx$NH43moSamp_dich, c("Low"))
+targetsx$NH41moSamp_dich <- fct_relevel(targetsx$NH41moSamp_dich, c("Low"))
+targetsx$BC5yrSamp_dich <- fct_relevel(targetsx$BC5yrSamp_dich, c("Low"))
+targetsx$BC1yrSamp_dich <- fct_relevel(targetsx$BC1yrSamp_dich, c("Low"))
+targetsx$BC6moSamp_dich <- fct_relevel(targetsx$BC6moSamp_dich, c("Low"))
+targetsx$BC3moSamp_dich <- fct_relevel(targetsx$BC3moSamp_dich, c("Low"))
+targetsx$BC1moSamp_dich <- fct_relevel(targetsx$BC1moSamp_dich, c("Low"))
+targetsx$OM5yrSamp_dich <- fct_relevel(targetsx$OM5yrSamp_dich, c("Low"))
+targetsx$OM1yrSamp_dich <- fct_relevel(targetsx$OM1yrSamp_dich, c("Low"))
+targetsx$OM6moSamp_dich <- fct_relevel(targetsx$OM6moSamp_dich, c("Low"))
+targetsx$OM3moSamp_dich <- fct_relevel(targetsx$OM3moSamp_dich, c("Low"))
+targetsx$OM1moSamp_dich <- fct_relevel(targetsx$OM1moSamp_dich, c("Low"))
+targetsx$SS5yrSamp_dich <- fct_relevel(targetsx$SS5yrSamp_dich, c("Low"))
+targetsx$SS1yrSamp_dich <- fct_relevel(targetsx$SS1yrSamp_dich, c("Low"))
+targetsx$SS6moSamp_dich <- fct_relevel(targetsx$SS6moSamp_dich, c("Low"))
+targetsx$SS3moSamp_dich <- fct_relevel(targetsx$SS3moSamp_dich, c("Low"))
+targetsx$SS1moSamp_dich <- fct_relevel(targetsx$SS1moSamp_dich, c("Low"))
+targetsx$Soil5yrSamp_dich <- fct_relevel(targetsx$Soil5yrSamp_dich, c("Low"))
+targetsx$Soil1yrSamp_dich <- fct_relevel(targetsx$Soil1yrSamp_dich, c("Low"))
+targetsx$Soil6moSamp_dich <- fct_relevel(targetsx$Soil6moSamp_dich, c("Low"))
+targetsx$Soil3moSamp_dich <- fct_relevel(targetsx$Soil3moSamp_dich, c("Low"))
+targetsx$Soil1moSamp_dich <- fct_relevel(targetsx$Soil1moSamp_dich, c("Low"))
+str(targetsx)
+```
+
+## Convert Date Columns to Date Format
+Next I need to convert all date columns to proper format
+```{r}
+targetsx <- targetsx %>% 
+  mutate_at(c("sample_date", "PM_date"), as.Date)
+```
+
+# Cell-Type Deconvolution
+```{r}
+out.l <- epidish(beta.m = bVals, ref.m = centEpiFibIC.m, method = "RPC")
+out.l$estF
+dim(out.l$ref)
+dim(out.l$dataREF)
+```
+Can see that the fast majority of samples had nearly 100% immune cells (IC)
+
+```{r}
+BloodFrac.m <- epidish(beta.m = bVals, ref.m = centDHSbloodDMC.m, method = "RPC")$estF
+```
+
+```{r}
+boxplot(BloodFrac.m)
+```
+Neutrophils are clearly the most highly represented cell type.
+
+## Refine Cell Distributions into Principal Components
+Need to ensure that none of our columns have values !=0
+```{r}
+colSums(is.na(BloodFrac.m))
+# All Eosino are =0 after batch correction, so will remove this column from the datafram
+BloodFrac.m <- as.data.frame(BloodFrac.m)
+BloodFrac.m <- BloodFrac.m %>% dplyr::select(!Eosino)
+```
+
+Need to normalize all the cell types so they are on the same scale
+```{r}
+BloodFrac_norm <- scale(BloodFrac.m)
+head(BloodFrac.m)
+head(BloodFrac_norm)
+```
+
+Make a correlation matrix
+```{r}
+library(ggcorrplot)
+corr_matrix <- cor(BloodFrac_norm)
+ggcorrplot(corr_matrix)
+```
+
+Plot scatterplot of CD4T vs Neuts for simple visualization of PCs
+```{r}
+BloodFrac.mx <- as.data.frame(BloodFrac.m)
+
+(BloodFrac.mx %>% ggplot(aes(x=Neutro, y=CD4T))+
+   geom_point()+
+   labs(x="Neutrophil Proportion", y="CD4+ T-Cell Proportion")+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+```{r}
+BloodFrac_pca <- princomp(corr_matrix)
+summary(BloodFrac_pca)
+```
+
+```{r}
+BloodFrac_pca$loadings[,1:5]
+```
+
+```{r}
+library(factoextra)
+fviz_eig(BloodFrac_pca, addlabels=T)
+```
+This scree plot shows that 54% of the variation in cell composition is retained in PC1, then the next 18.5% in PC2, and so on...
+
+Another method of scree plot
+```{r}
+screeplot(BloodFrac_pca, type="l", main="Scree Plot for Cell Distributions")
+```
+Basically the same as above, just with different y-axis scale
+
+```{r}
+fviz_pca_var(BloodFrac_pca, col.var = "black")
+```
+Can see that Neutrophils are a major driver of the PCA that moves in the opposite direction of other cell types. 
+Lines that group together are positively correlated with each other, so CD4 T-cells and B-cells are positively correlated, as are Eos/NK/CD8 T-cells. CD4 T-Cells and CD8 T-cells are negatively correlated with each other
+
+```{r}
+fviz_cos2(BloodFrac_pca, choice = "var", axes = 1:5)
+```
+This shows that Neuts are contributing the most the the first 5 PCAs, whereas Eos are contributing the least.
+
+```{r}
+BloodFrac_norm <- as.data.frame(BloodFrac_norm)
+BloodFrac_PCs <- principal(BloodFrac_norm, nfactors=5, rotate="none")
+BloodFrac_PCs
+```
+The cumulative variance after PC5 is 0.94, suggesting that by using the first 5 PCs, we are only missing around 6% of the variance in our cell distribution dataset.
+
+```{r}
+BloodFrac_PC.fit <- prcomp(~ B + NK + CD4T + CD8T + Mono + Neutro,
+                           data=BloodFrac_norm, 
+                           scale=TRUE)
+summary(BloodFrac_PC.fit)
+```
+
+Then convert this into dataframe where there is a PC assigned to each row (i.e. each individual)
+```{r}
+new_BloodFrac <- as.data.frame(predict(BloodFrac_PC.fit, BloodFrac_norm)[,1:5])
+```
+
+## Add Immune Cell Distribution Columns to targetsx
+```{r}
+new_BloodFrac <- as.data.frame(new_BloodFrac) 
+EPIC_ID <- as.data.frame(Simmons_IDs)
+EPIC_ID <- sub("Simmons.","",EPIC_ID$Simmons_IDs)
+EPIC_ID <- as.data.frame(EPIC_ID) 
+```
+
+```{r}
+new_BloodFrac <- cbind(EPIC_ID, new_BloodFrac)
+```
+
+```{r}
+targetsx <- left_join(targetsx, new_BloodFrac, by="EPIC_ID")
+```
+
+
+# PM2.5 Differential Methylation
+## Differential methylation by Continuous PM2.5 in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by PM_5yrPreSamp
+```{r}
+# Convert PM_5yrPreSamp to numeric
+PM5yrPreSamp_cont <- as.numeric(targetsx$PM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ PM5yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there is 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousPM5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.19 for this analysis.
+
+
+
+## Differential methylation by Continuous PM2.5 in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert PM_5yrPreSamp to numeric
+PM5yrPreSamp_cont <- as.numeric(targetsx$PM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ PM5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels in low vs high PM2.5 in 5yrs pre-sampling and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousPM5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.11 for this analysis.
+
+
+
+## Differential methylation by Continuous PM2.5 in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert PM_5yrPreSamp to numeric
+PM5yrPreSamp_cont <- as.numeric(targetsx$PM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ PM5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+CRTAP is second CpG, but p=0.54 after FDR-correction
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousPM5yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.27 for this analysis.
+
+
+
+### PM5yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+PM5yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in PM5yr_manhattan to match the function's expected names
+names(PM5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+PM5yr_manhattan$CHR <- as.numeric(sub("chr", "", PM5yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified PM5yr_manhattan dataframe
+gg.manhattan(PM5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "PM5yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_PM5yr_adj <- extractRanges(DMRs)
+#results.ranges_PM5yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_PM5yr_adj <- goregion(results.ranges_PM5yr_adj[1:1], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_PM5yr_adj <- enrichment_GO_PM5yr_adj[order(enrichment_GO_PM5yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_PM5yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_PM5yr_adj <- as.data.frame(results.ranges_PM5yr_adj)
+
+#write.table(results.ranges_PM5yr_adj, file="Simmons_IPF_ContinuousPM5yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Remove unnecessary files
+```{r}
+rm(list=ls(pattern="^enrichment"))
+rm(list=ls(pattern="^BloodFrac"))
+rm(list=ls(pattern="^fit"))
+rm(list=ls(pattern="^results"))
+rm(list=c("meta", "EPIC_ID", "dat", "new_BloodFrac"))
+```
+
+
+
+# SO4 Differential Methylation
+## Differential methylation by Continuous SO4 in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by SO4_5yrPreSamp
+```{r}
+# Convert SO4_5yrPreSamp to numeric
+SO45yrPreSamp_cont <- as.numeric(targetsx$SO4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SO45yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 1 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousSO45yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.26 for this analysis.
+
+
+
+## Differential methylation by Continuous SO4 in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert SO4_5yrPreSamp to numeric
+SO45yrPreSamp_cont <- as.numeric(targetsx$SO4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SO45yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 1 CpGs with lower DNAm levels in low vs high SO4 in 5yrs pre-sampling and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSO45yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.17 for this analysis.
+
+
+
+## Differential methylation by Continuous SO4 in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert SO4_5yrPreSamp to numeric
+SO45yrPreSamp_cont <- as.numeric(targetsx$SO4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SO45yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 1 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSO45yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.31 for this analysis.
+
+### SO45yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=-log10(8e-07),
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+
+
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+SO45yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in SO45yr_manhattan to match the function's expected names
+names(SO45yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+SO45yr_manhattan$CHR <- as.numeric(sub("chr", "", SO45yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified PM5yr_manhattan dataframe
+gg.manhattan(SO45yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "SO45yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+
+```{r}
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+results.ranges_SO45yr_adj <- extractRanges(DMRs)
+results.ranges_SO45yr_adj
+```
+Sig DMR in TNXB
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+enrichment_GO_SO45yr_adj <- goregion(results.ranges_SO45yr_adj[1:1], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+enrichment_GO_SO45yr_adj <- enrichment_GO_SO45yr_adj[order(enrichment_GO_SO45yr_adj$P.DE),]
+head(as.matrix(enrichment_GO_SO45yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+results.ranges_SO45yr_adj <- as.data.frame(results.ranges_SO45yr_adj)
+
+write.table(results.ranges_SO45yr_adj, file="Simmons_IPF_ContinuousSO45yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# NO3 Differential Methylation
+## Differential methylation by Continuous NO3 in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by NO3_5yrPreSamp
+```{r}
+# Convert NO3_5yrPreSamp to numeric
+NO35yrPreSamp_cont <- as.numeric(targetsx$NO3_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NO35yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousNO35yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.98 for this analysis.
+
+
+
+## Differential methylation by Continuous NO3 in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert NO3_5yrPreSamp to numeric
+NO35yrPreSamp_cont <- as.numeric(targetsx$NO3_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NO35yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousNO35yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.97 for this analysis.
+
+
+
+## Differential methylation by Continuous NO3 in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert NO3_5yrPreSamp to numeric
+NO35yrPreSamp_cont <- as.numeric(targetsx$NO3_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NO35yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousNO35yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.92 for this analysis.
+
+
+
+### NO35yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+NO35yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in NO35yr_manhattan to match the function's expected names
+names(NO35yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+NO35yr_manhattan$CHR <- as.numeric(sub("chr", "", NO35yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified NO35yr_manhattan dataframe
+gg.manhattan(NO35yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "NO35yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+Can't run as no sig CpGs
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_NO35yr_adj <- extractRanges(DMRs)
+#results.ranges_NO35yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_NO35yr_adj <- goregion(results.ranges_NO35yr_adj[1:6], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_NO35yr_adj <- enrichment_GO_NO35yr_adj[order(enrichment_GO_NO35yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_NO35yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_NO35yr_adj <- as.data.frame(results.ranges_NO35yr_adj)
+
+#write.table(results.ranges_NO35yr_adj, file="Simmons_IPF_ContinuousNO35yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# NH4 Differential Methylation
+## Differential methylation by Continuous NH4 in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by NH4_5yrPreSamp
+```{r}
+# Convert NH4_5yrPreSamp to numeric
+NH45yrPreSamp_cont <- as.numeric(targetsx$NH4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NH45yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 2 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousNH45yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.27 for this analysis.
+
+
+
+## Differential methylation by Continuous NH4 in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert NH4_5yrPreSamp to numeric
+NH45yrPreSamp_cont <- as.numeric(targetsx$NH4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NH45yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 1 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousNH45yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.15 for this analysis.
+
+
+
+## Differential methylation by Continuous NH4 in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert NH4_5yrPreSamp to numeric
+NH45yrPreSamp_cont <- as.numeric(targetsx$NH4_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ NH45yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 2 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousNH45yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.34 for this analysis.
+
+
+### NH45yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=-log10(7e-07),
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+
+
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+NH45yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in NH45yr_manhattan to match the function's expected names
+names(NH45yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+NH45yr_manhattan$CHR <- as.numeric(sub("chr", "", NH45yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified NH45yr_manhattan dataframe
+gg.manhattan(NH45yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "NH45yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+
+```{r}
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+results.ranges_NH45yr_adj <- extractRanges(DMRs)
+results.ranges_NH45yr_adj
+```
+Sig DMR in VTRNA2-1 (https://www.genecards.org/cgi-bin/carddisp.pl?gene=VTRNA2-1&keywords=VTRNA2-1 - gene produces an RNA pol III transcript that directly inhibits protein kinase R, which regulates cell growth)
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+enrichment_GO_NH45yr_adj <- goregion(results.ranges_NH45yr_adj[1:1], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+enrichment_GO_NH45yr_adj <- enrichment_GO_NH45yr_adj[order(enrichment_GO_NH45yr_adj$P.DE),]
+head(as.matrix(enrichment_GO_NH45yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+results.ranges_NH45yr_adj <- as.data.frame(results.ranges_NH45yr_adj)
+
+write.table(results.ranges_NH45yr_adj, file="Simmons_IPF_ContinuousNH45yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# BC Differential Methylation
+## Differential methylation by Continuous BC in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by BC_5yrPreSamp
+```{r}
+# Convert BC_5yrPreSamp to numeric
+BC5yrPreSamp_cont <- as.numeric(targetsx$BC_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ BC5yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousBC5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.05 for this analysis.
+
+
+
+## Differential methylation by Continuous BC in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert BC_5yrPreSamp to numeric
+BC5yrPreSamp_cont <- as.numeric(targetsx$BC_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ BC5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousBC5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.00 for this analysis.
+
+
+
+## Differential methylation by Continuous BC in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert BC_5yrPreSamp to numeric
+BC5yrPreSamp_cont <- as.numeric(targetsx$BC_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ BC5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousBC5yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 1.03 for this analysis.
+
+
+
+### BC5yr Manhattan Plot
+```{r}
+gg.manhattan = function(dataframe, title=NULL, cols = c('red', 'skyblue'),
+                        chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'rsid', gene.fld=NULL,
+                        chrs = 1:22, ymax = NULL,
+                        suggestiveline=0, genomewideline=NULL,
+                        annotate=F, annotate.fld=NULL, SNPlist=NULL,lab2lim=NULL,lab3lim=NULL) {
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+
+  if (annotate & is.null(SNPlist))
+    stop("You requested annotation but provided no SNPlist!")
+  #if(annotate & any(! unlist(SNPlist) %in% dataframe[[snp.fld]]))
+  #  stop('No SNPs in SNPlist are found in the dataframe')
+
+  if(is.data.table(dataframe)) dataframe <- as.data.frame(dataframe)
+
+  stopifnot(all(c(chr.fld, pos.fld, p.fld, snp.fld) %in% names(dataframe)),
+            is.data.frame(dataframe),
+            all(!is.na(dataframe[[chr.fld]])),
+            all(unlist(lapply(dataframe[c(chr.fld, pos.fld, p.fld)], is.numeric))))
+  if(is.null(gene.fld)){
+    d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld)]
+    names(d) <- c('CHR', 'BP', 'P', 'SNP')
+  }else{
+  d <- dataframe[c(chr.fld, pos.fld, p.fld, snp.fld, gene.fld)]
+  names(d) <- c('CHR', 'BP', 'P', 'SNP','Gene')
+  }
+
+  #limit to only chrs 1-22
+  d <- d %>% filter(CHR %in% chrs, P > 0, P <= 1, !is.na(BP)) %>%
+    mutate(logp = -log10(P)) %>% arrange(CHR, BP)
+
+  # get position references for each CHR:
+  d$CHR <- factor(d$CHR)
+  posDat <- d %>% group_by(CHR) %>% dplyr::summarise(maxBP = max(BP))
+
+  tmp <- data.frame(0, 0); names(tmp) <- names(posDat)
+  posDat <- rbind(tmp, posDat)
+  posDat$cumBP <- sapply(1:nrow(posDat), function(x) sum(posDat$maxBP[1:x]))
+  posDat <- data.frame(CHR = posDat$CHR[-1], addBP = posDat$cumBP[-nrow(posDat)])
+
+  d <- merge(d, posDat, all.x = T)
+
+  d <- d %>% mutate(pos = BP + addBP)
+  ticks <- d %>% group_by(CHR) %>% dplyr::summarise(x = median(pos))
+
+  mycols <- rep(cols, length(chrs))[1:length(unique(chrs))]
+
+  if(length(unique(chrs)) == 1){
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      xlab(paste('Chromosome', unique(chrs)))
+  } else {
+    plot <- ggplot(d, aes(x = pos, y = logp, color = CHR)) +
+      scale_x_continuous(name = 'Chromosome', breaks = ticks$x, labels = ticks$CHR)
+  }
+  upper <- ceiling(max(d$logp))
+  if(!is.null(ymax) && is.numeric(ymax)){
+    upper <- ceiling(ymax)
+  }
+  plot <- plot + geom_point() + scale_color_manual(values = mycols) +
+    scale_y_continuous(breaks = seq(1, upper, by = floor(upper/6))) +
+    ylab(expression(-log[10](italic(p)))) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = rel(2), color = 'black'),
+          axis.text.x = element_text(size = rel(1.5), color = 'black'),
+          legend.position = 'none', plot.title = element_text(size = rel(5), hjust = 0.5),
+          panel.grid.minor = element_blank())
+
+  if(annotate){
+	 if(annotate.fld=='SNP'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- SNPlist[[1]]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- SNPlist[[2]]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size = 5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}else if(annotate.fld == 'Gene'){
+		if(length(SNPlist)==1){
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=c(5,ymax))
+		}else{
+		d$labl1 <- ''
+		d$labl1[match(SNPlist[[1]], d$SNP)] <- d$Gene[match(SNPlist[[1]], d$SNP)]
+		d$labl2 <- ''
+		d$labl2[match(SNPlist[[2]], d$SNP)] <- d$Gene[match(SNPlist[[2]], d$SNP)]
+		plot <- plot +
+		geom_text_repel(aes(label=d$labl1), size =5, color='black',ylim=lab2lim,min.segment.length=0.1)+
+		geom_text_repel(aes(label=d$labl2), size = 5, color='orange',ylim=lab3lim,segment.alpha=0.4,min.segment.length=0.1)
+		}
+	}
+  }
+
+  if (!is.null(suggestiveline))
+    plot <- plot + geom_hline(yintercept = suggestiveline, colour="brown", alpha = 0.33)
+  if (!is.null(genomewideline))
+    plot <- plot + geom_hline(yintercept = genomewideline, colour = "brown")
+  if(!is.null(ymax) && is.numeric(ymax)){
+    if(ymax <= max(d$logp) & ymax >= 0)
+      plot <- plot + ylim(0, ymax)
+  }
+  plot
+}
+
+
+```
+
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+BC5yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in BC5yr_manhattan to match the function's expected names
+names(BC5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+BC5yr_manhattan$CHR <- as.numeric(sub("chr", "", BC5yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified BC5yr_manhattan dataframe
+gg.manhattan(BC5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "BC5yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+Can't run as no sig CpGs
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_BC5yr_adj <- extractRanges(DMRs)
+#results.ranges_BC5yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_BC5yr_adj <- goregion(results.ranges_BC5yr_adj[1:6], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_BC5yr_adj <- enrichment_GO_BC5yr_adj[order(enrichment_GO_BC5yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_BC5yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_BC5yr_adj <- as.data.frame(results.ranges_BC5yr_adj)
+
+#write.table(results.ranges_BC5yr_adj, file="Simmons_IPF_ContinuousBC5yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# OM Differential Methylation
+## Differential methylation by Continuous OM in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by OM_5yrPreSamp
+```{r}
+# Convert OM_5yrPreSamp to numeric
+OM5yrPreSamp_cont <- as.numeric(targetsx$OM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ OM5yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousOM5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.87 for this analysis.
+
+
+
+## Differential methylation by Continuous OM in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert OM_5yrPreSamp to numeric
+OM5yrPreSamp_cont <- as.numeric(targetsx$OM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ OM5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousOM5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.86 for this analysis.
+
+
+
+## Differential methylation by Continuous OM in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert OM_5yrPreSamp to numeric
+OM5yrPreSamp_cont <- as.numeric(targetsx$OM_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ OM5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousOM5yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.94 for this analysis.
+
+
+### OM5yr Manhattan Plot
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+OM5yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in OM5yr_manhattan to match the function's expected names
+names(OM5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+OM5yr_manhattan$CHR <- as.numeric(sub("chr", "", OM5yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified OM5yr_manhattan dataframe
+gg.manhattan(OM5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "OM5yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+No sig CpGs so can't run DMR or GO
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_OM5yr_adj <- extractRanges(DMRs)
+#results.ranges_OM5yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_OM5yr_adj <- goregion(results.ranges_OM5yr_adj[1:6], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_OM5yr_adj <- enrichment_GO_OM5yr_adj[order(enrichment_GO_OM5yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_OM5yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_OM5yr_adj <- as.data.frame(results.ranges_OM5yr_adj)
+
+#write.table(results.ranges_OM5yr_adj, file="Simmons_IPF_ContinuousOM5yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# SS Differential Methylation
+## Differential methylation by Continuous SS in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by SS_5yrPreSamp
+```{r}
+# Convert SS_5yrPreSamp to numeric
+SS5yrPreSamp_cont <- as.numeric(targetsx$SS_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SS5yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousSS5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.72 for this analysis.
+
+
+
+## Differential methylation by Continuous SS in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert SS_5yrPreSamp to numeric
+SS5yrPreSamp_cont <- as.numeric(targetsx$SS_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SS5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels in low vs high SS in 5yrs pre-sampling and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSS5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.76 for this analysis.
+
+
+
+## Differential methylation by Continuous SS in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert SS_5yrPreSamp to numeric
+SS5yrPreSamp_cont <- as.numeric(targetsx$SS_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ SS5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSS5yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.83 for this analysis.
+
+
+### SS5yr Manhattan Plot
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+SS5yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in SS5yr_manhattan to match the function's expected names
+names(SS5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+SS5yr_manhattan$CHR <- as.numeric(sub("chr", "", SS5yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified SS5yr_manhattan dataframe
+gg.manhattan(SS5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "SS5yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+No sig CpGs so can't run DMR or GO
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_SS5yr_adj <- extractRanges(DMRs)
+#results.ranges_SS5yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_SS5yr_adj <- goregion(results.ranges_SS5yr_adj[1:6], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_SS5yr_adj <- enrichment_GO_SS5yr_adj[order(enrichment_GO_SS5yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_SS5yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_SS5yr_adj <- as.data.frame(results.ranges_SS5yr_adj)
+
+#write.table(results.ranges_SS5yr_adj, file="Simmons_IPF_ContinuousSS5yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+
+
+# Soil Differential Methylation
+## Differential methylation by Continuous Soil in 5yrs Pre-Sampling - Unadjusted
+First analysis I will do is evaluate for differential methylation by Soil_5yrPreSamp
+```{r}
+# Convert Soil_5yrPreSamp to numeric
+Soil5yrPreSamp_cont <- as.numeric(targetsx$Soil_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ Soil5yrPreSamp_cont, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsUnadjusted_IPF_ContinuousSoil5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.89 for this analysis.
+
+
+
+## Differential methylation by Continuous Soil in 5yrs Pre-Sampling - Adjusted
+```{r}
+# Convert Soil_5yrPreSamp to numeric
+Soil5yrPreSamp_cont <- as.numeric(targetsx$Soil_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ Soil5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels in low vs high Soil in 5yrs pre-sampling and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSoil5yrPreSamp_DMPs_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.89 for this analysis.
+
+
+
+## Differential methylation by Continuous Soil in 5yrs Pre-Sampling - Covariate + Cell Type Adjustment
+```{r}
+# Convert Soil_5yrPreSamp to numeric
+Soil5yrPreSamp_cont <- as.numeric(targetsx$Soil_5yrPreSamp)
+
+# Create a design matrix including the continuous variable
+design <- model.matrix(~ Soil5yrPreSamp_cont+sex+age_dx+d_Race+smokeHx+dx_IPF+PC1+PC2+PC3+PC4+PC5, data=targetsx)
+
+# Fit the linear model
+fit <- lmFit(mVals, design)
+
+# Apply eBayes
+fit2 <- eBayes(fit)
+```
+
+```{r}
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+So we can see here that there are 0 CpGs with lower DNAm levels and 0 CpGs with higher DNAm levels
+
+
+```{r}
+DMPs <- topTable(fit2, num=Inf, coef=2, genelist=annoSub)
+head(DMPs)
+```
+
+Calculate mean P-value for DMP analysis
+```{r}
+mean(DMPs$P.Value)
+```
+
+Write the DMPs df to a table
+```{r, eval=F}
+write.table(DMPs, file="SimmonsAdjusted_IPF_ContinuousSoil5yrPreSamp_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
+
+Calculating the Genomic Inflation Factor
+```{r}
+DMPs$chisq <- qchisq(1-DMPs$P.Value,1)
+gif <- median(DMPs$chisq)/qchisq(0.5,1)
+gif
+```
+The genomic inflation factor (lambda) is 0.88 for this analysis.
+
+### Soil5yr Manhattan Plot
+```{r}
+SNPlist <- as.list(DMPs$Name)
+```
+
+```{r}
+Soil5yr_manhattan <- DMPs %>% dplyr::select(chr, pos, P.Value, Name, GencodeBasicV12_NAME) 
+
+# Renaming columns in Soil5yr_manhattan to match the function's expected names
+names(Soil5yr_manhattan) <- c('CHR', 'BP', 'P', 'SNP', 'Gene')
+
+# Remove "chr" prefix and convert to numeric
+Soil5yr_manhattan$CHR <- as.numeric(sub("chr", "", Soil5yr_manhattan$CHR))
+```
+
+```{r}
+# Running gg.manhattan with the modified Soil5yr_manhattan dataframe
+gg.manhattan(Soil5yr_manhattan, chr.fld = 'CHR', pos.fld = 'BP', p.fld = 'P', snp.fld = 'SNP', gene.fld = 'Gene', annotate = FALSE, SNPlist = SNPlist)
+```
+
+
+
+
+QQ plot
+```{r}
+qq(DMPs$P.Value)
+```
+
+
+
+### DMR Analysis
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = FALSE, 
+                             coef = "Soil5yrPreSamp_cont", arraytype = "EPIC")
+str(myAnnotation)
+```
+
+No sig CpGs so can't run DMR or GO
+```{r}
+#DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+#results.ranges_Soil5yr_adj <- extractRanges(DMRs)
+#results.ranges_Soil5yr_adj
+```
+
+
+### Gene Ontology Adjusted Analysis
+```{r}
+#enrichment_GO_Soil5yr_adj <- goregion(results.ranges_Soil5yr_adj[1:6], all.cpg = rownames(mVals), collection = "GO", array.type = "EPIC")
+#enrichment_GO_Soil5yr_adj <- enrichment_GO_Soil5yr_adj[order(enrichment_GO_Soil5yr_adj$P.DE),]
+#head(as.matrix(enrichment_GO_Soil5yr_adj), 10)
+```
+
+### Write DMR Results to .csv
+```{r, eval=F}
+#results.ranges_Soil5yr_adj <- as.data.frame(results.ranges_Soil5yr_adj)
+
+#write.table(results.ranges_Soil5yr_adj, file="Simmons_IPF_ContinuousSoil5yrSamp_DMRs_ComBatCellDeconvAx_2024_07_22.csv", sep=",", row.names=FALSE)
+```
