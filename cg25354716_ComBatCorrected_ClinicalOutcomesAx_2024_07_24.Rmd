@@ -1,0 +1,3015 @@
+---
+title: "ComBat Corrected cg25354716 Locus-Specific Survival, Lung Function, and Mediation Analysis"
+author: "Gillian Goobie"
+date: "2024_07_24"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+  bookdown::html_document2:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=F}
+library(tidyverse)
+library(readxl)
+library(sesame)
+library(sesameData)
+library(parallel)
+library(here)
+library(SummarizedExperiment)
+library(knitr)
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(writexl)
+library(survival)
+library(survminer)
+library(lubridate)
+library(cmprsk)
+library(prodlim)
+library(RColorBrewer)
+library(prodlim)
+library(lme4)
+library(splines)
+library(pspline)
+library(mediation)
+library(betareg)
+library(ChAMP)
+library(lumi)
+```
+
+# Load Processed DNAm Data
+"DNAmEPIC_Environment.RData" has all the other files as well as the original bVals and mVals prior to ComBat correction
+```{r}
+load("~/DNAmEPIC/DNAmEPIC_Environment.RData")
+```
+
+Below is loading the ComBat corrected bVals and mVals objects
+```{r}
+load("~/DNAmEPIC/bVals_mVals_FullCohort_PostComBat_PlateArray.RData")
+```
+
+# Fix Simmons race based on chart review by Sharon (2023/11/01)
+```{r}
+#First create a dataframe of the patients with race that needs to be fixed. They're all White.
+fix_race <- data.frame(
+  ID=c(8354, 9434, 10526, 13285, 13310, 13619, 13714, 16924, 22220),
+  new_race=rep("W", times=9),
+  new_dich_Race=rep("White", times=9),
+  new_d_Race=rep("White", times=9)
+)
+
+#Next perform the replacement using a left_join
+meta <- meta %>% left_join(fix_race, by="ID") %>% 
+  mutate(
+    race=coalesce(new_race, race),
+    dich_Race=coalesce(new_dich_Race, dich_Race)
+  ) %>% 
+  dplyr::select(-new_race, -new_dich_Race) #drop the temporary columns
+
+targetsx <- targetsx %>% left_join(fix_race, by=c("ID.y"="ID")) %>% 
+  mutate(
+    race=coalesce(new_race, race),
+    dich_Race=coalesce(new_dich_Race, dich_Race),
+    d_Race=coalesce(new_d_Race, d_Race)
+  ) %>% 
+  dplyr::select(-new_race, -new_dich_Race, -new_d_Race) #drop the temporary columns
+```
+
+# ComBat Batch Correction
+## Correct pd file
+The pd file is otherwise known as the Sample_Sheet.csv or "targets" in the DNAmEPIC_Environment.RData. This is the file where the base data from the .idat files is retained that will allow us to look for batch effects.
+
+First we need to define "Sample_Group" based on low vs high PM2.5 in 5yrs pre-sampling
+```{r, eval=F}
+targetsx$Sample_Group <- targetsx$PM5yrSamp_dich
+```
+
+
+```{r, eval=F}
+#Need to first rename EPIC_ID to Sample_Name to be consistent with formatting required by ComBat
+targets.c <- targetsx %>% rename("EPIC_ID"="Sample_Name", "cohort"="Project")
+colnames(targets.c)
+```
+
+```{r, eval=F}
+targets.c <- targets.c %>% dplyr::select(Sample_Name, Sample_Plate, Sample_Group, Pool_ID, Project, Sample_Well, Array, Slide, Basename)
+targets.c$filename <- NA
+targets.c$PM5yr_dich <- targets.c$Sample_Group
+targets.c$Sample_Group <- 1
+targets.c <- targets.c %>% mutate(across(c("Pool_ID", "Sample_Well", "Array", "filename"), as.factor))
+str(targets.c)
+```
+
+```{r, eval=F}
+targets.c$Sample_Plate <- droplevels(targets.c$Sample_Plate)
+str(targets.c$Sample_Plate)
+```
+
+
+## Check Baseline SVD (Singular Variable Decomposition)
+SVD will detect the number and nature of significant sources of variation in the methylation dataset and is helpful in determining if correction for batch effects is required.
+```{r, eval=F}
+bVals.df <- as.data.frame(bVals)
+champ.SVD(beta=bVals.df, pd=targets.c)
+```
+This suggests that there are likely significant slide and plate batch effects here that should be corrected for.
+
+
+## Batch Correct Plate and Array
+Ideally we would want to batch correct Slide and Plate, but ComBat will not run with these two factors corrected because it produces an error that states: 
+"Error in ComBat(dat = beta, batch = batch, mod = mod, par.prior = TRUE) : 
+The covariates are confounded! Please remove one or more of the covariates so the design is not confounded"
+
+As such, we decided to correct for Array and Plate as the total number of factors is less and the resulting SVD plot seemed to decrease the apparent batch effects.
+```{r, eval=F}
+mycombat.arrayplate <- champ.runCombat(beta=bVals.df, pd=targets.c, batchname=c("Array", "Sample_Plate"), logitTrans=TRUE)
+```
+
+```{r, eval=F}
+mycombat.arrayplatedf <- as.data.frame(mycombat.arrayplate)
+```
+
+```{r, eval=F}
+champ.SVD(beta=mycombat.arrayplatedf, pd=targets.c)
+```
+
+## Re-Make bVals Dataframe
+```{r, eval=F}
+bVals <- mycombat.arrayplate
+```
+
+```{r, eval=F}
+#Convert bVals matrix to mVals matrix 
+mVals <- beta2m(bVals)
+```
+
+
+
+
+
+# Extract cg25354716
+```{r}
+CpG <- "cg25354716"
+str(CpG)
+CRTAP <- bVals[rownames(bVals) %in% CpG,]
+CRTAP <- as.data.frame(CRTAP)
+CRTAP <- rownames_to_column(CRTAP)
+```
+
+
+```{r}
+CRTAP <- CRTAP %>% separate(rowname, into=c("cohort","EPIC_ID"), sep="\\.")
+CRTAP <- CRTAP %>% rename("CRTAP"="cg25354716")
+```
+
+# Merge CRTAP with meta
+```{r}
+meta <- left_join(meta, CRTAP, by=c("EPIC_ID", "cohort"))
+```
+
+# Create Cohort-Specific Dataframes
+```{r}
+CARE <- meta %>% filter(cohort=="CARE")
+Simm <- meta %>% filter(cohort=="Simmons")
+```
+
+
+# Summarize cg25354716
+```{r}
+summary(Simm$cg25354716)
+summary(CARE$cg25354716)
+summary(meta$cg25354716)
+```
+B-value for CARE slightly higher for cg25354716 than Simmons
+
+## Make Quartiled cg25354716 based on combined cohort cut points
+```{r}
+Simm$cg25354716_quart <- cut(Simm$cg25354716,
+                      breaks=c(0, 0.6737, 0.7010, 0.7278, 1),
+                      labels=c("Q1", "Q2", "Q3", "Q4"))
+summary(Simm$cg25354716_quart)
+class(Simm$cg25354716_quart)
+
+CARE$cg25354716_quart <- cut(CARE$cg25354716,
+                      breaks=c(0, 0.6737, 0.7010, 0.7278, 1),
+                      labels=c("Q1", "Q2", "Q3", "Q4"))
+summary(CARE$cg25354716_quart)
+class(CARE$cg25354716_quart)
+
+meta$cg25354716_quart <- cut(meta$cg25354716,
+                      breaks=c(0, 0.6737, 0.7010, 0.7278, 1),
+                      labels=c("Q1", "Q2", "Q3", "Q4"))
+summary(meta$cg25354716_quart)
+class(meta$cg25354716_quart)
+```
+
+# Make Dichotomized cg25354716
+```{r}
+Simm$cg25354716_dich <- cut(Simm$cg25354716,
+                      breaks=c(0, 0.7010, 1),
+                      labels=c("Low", "High"))
+summary(Simm$cg25354716_dich)
+class(Simm$cg25354716_dich)
+
+CARE$cg25354716_dich <- cut(CARE$cg25354716,
+                      breaks=c(0, 0.7010, 1),
+                      labels=c("Low", "High"))
+summary(CARE$cg25354716_dich)
+class(CARE$cg25354716_dich)
+
+meta$cg25354716_dich <- cut(meta$cg25354716,
+                      breaks=c(0, 0.7010, 1),
+                      labels=c("Low", "High"))
+summary(meta$cg25354716_dich)
+class(meta$cg25354716_dich)
+```
+
+# Make cg25354716 Scale Increase by 10x
+```{r}
+Simm$cg25354716 <- (Simm$cg25354716*10)
+CARE$cg25354716 <- (CARE$cg25354716*10)
+meta$cg25354716 <- (meta$cg25354716*10)
+```
+
+
+# Make deadORtx
+```{r}
+Simm <- Simm %>% mutate(deadORtx = if_else(status==1 | status==2, 1, 0))
+CARE <- CARE %>% mutate(deadORtx = if_else(status==1 | status==2, 1, 0))
+```
+
+```{r}
+print(Simm$status)
+print(Simm$deadORtx)
+```
+
+```{r}
+print(CARE$status)
+print(CARE$deadORtx)
+```
+
+
+# Combining Cohorts
+```{r}
+colnames(Simm)==colnames(CARE)
+All <- rbind(Simm, CARE)
+```
+
+```{r, height=5, width=5}
+(All %>% ggplot(aes(x=PM_5yrPreSamp, color=cohort))+
+   geom_density(alpha=0.7, aes(fill=cohort))+
+   labs(x="PM2.5 in 5yr Pre-Sampling", y="Density of Patients with this PM2.5 Level", title="PM2.5 Density Plot")+
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5))+
+   scale_color_manual(values=c("red","gold1"))+
+   scale_fill_manual(values=c("indianred1","lightgoldenrod1"))+
+   xlim(1, 18))
+```
+
+# Cohort Summary Data
+```{r}
+n_prop_tbl <- function(x) {
+  tbl <- table(x)
+  res <- cbind(tbl, round(prop.table(tbl)*100,2))
+  colnames(res) <-  c('Count', 'Percentage')
+  res
+}
+```
+
+## Sex
+```{r}
+n_prop_tbl(Simm$sex)
+n_prop_tbl(CARE$sex)
+n_prop_tbl(All$sex)
+```
+
+## Race
+```{r}
+n_prop_tbl(Simm$race)
+n_prop_tbl(Simm$dich_Race)
+n_prop_tbl(CARE$race)
+n_prop_tbl(CARE$dich_Race)
+n_prop_tbl(All$race)
+n_prop_tbl(All$dich_Race)
+```
+
+## Smoking
+```{r}
+n_prop_tbl(Simm$smokeHx)
+n_prop_tbl(CARE$smokeHx)
+n_prop_tbl(All$smokeHx)
+```
+
+## Diagnosis Groups
+```{r}
+n_prop_tbl(Simm$dx_group)
+n_prop_tbl(CARE$dx_group)
+n_prop_tbl(All$dx_group)
+```
+
+
+## Age_dx
+```{r}
+summary(Simm$age_dx)
+summary(CARE$age_dx)
+summary(All$age_dx)
+```
+
+## Baseline FVC
+```{r}
+summary(Simm$fvc_pct)
+summary(CARE$fvc_pct)
+summary(All$fvc_pct)
+```
+
+## Baseline DLCO
+```{r}
+summary(Simm$dlco_pct)
+summary(CARE$dlco_pct)
+summary(All$dlco_pct)
+```
+
+## Time to Censoring
+```{r}
+summary(Simm$time_DeathTxCensor)
+summary(CARE$time_DeathTxCensor)
+summary(All$time_DeathTxCensor)
+```
+
+## Survival Status
+```{r}
+n_prop_tbl(Simm$status)
+n_prop_tbl(CARE$status)
+n_prop_tbl(All$status)
+```
+
+## PM_5yrPreSamp
+```{r}
+summary(Simm$PM_5yrPreSamp)
+summary(CARE$PM_5yrPreSamp)
+summary(All$PM_5yrPreSamp)
+```
+
+## PM_3moPreSamp
+```{r}
+summary(Simm$PM_3moPreSamp)
+summary(CARE$PM_3moPreSamp)
+summary(All$PM_3moPreSamp)
+```
+
+# Simmons Survival Analysis by cg25354716
+## Continuous cg25354716
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716, data=Simm, id=ID)
+summary(coxPH_model1)
+```
+In this unadjusted model, methylation at cg25354716 not associated with mortality.
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm, id=ID)
+summary(coxPH_model2)
+```
+*This model indicates that higher methylation of cg25354716 is marginally assoc with lower mortality in adjusted models.*
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct, data=Simm, id=ID)
+summary(coxPH_model3)
+```
+This model indicates that higher methylation of cg25354716 is not assoc with lower mortality in adjusted models including baseline FVC and DLCO, indicating that the effect of this locus may be mediated through lung function.
+
+### Variable HR for cg25354716
+Want a plot with x-axis of Simm level and y-axis of HR
+
+Unadjusted model
+```{r}
+#First need to make dataframe that only includes patients with time_DeathTxCensor
+Simmx <- Simm %>% filter(!is.na(cg25354716) & !is.na(time_DeathTxCensor))
+
+#Then make survival function
+surv1 <- Surv(Simmx$time_DeathTxCensor, Simmx$deadORtx==1)
+fit1 <- coxph(surv1 ~ pspline(Simmx$cg25354716, df=4))
+predicted <- predict(fit1, type="terms", se.fit=T, terms=1)
+
+#Then plot
+plot(Simmx$cg25354716, exp(predicted$fit), type="n", xlim=c(6,8), ylim=c(0.8,1.1))
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit)), col = "red" , lty = 1 )
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit + 1.96 * predicted$se)), col = "orange" , lty = 2 )
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit - 1.96 * predicted$se)), col = "orange" , lty = 2 )
+```
+
+Partially-adjusted model
+```{r}
+#First need to make dataframe that only includes patients with time_DeathTxCensor
+Simmx <- Simm %>% filter(!is.na(cg25354716) & !is.na(time_DeathTxCensor) & !is.na(age_dx) & !is.na(sex) & !is.na(smokeHx) & !is.na(dich_Race) & !is.na(dx_IPF) & !is.na(disadv))
+
+#Then survival function
+surv1 <- Surv(Simmx$time_DeathTxCensor, Simmx$deadORtx==1)
+fit1 <- coxph(surv1 ~ pspline(Simmx$cg25354716, df=4) + Simmx$age_dx + Simmx$sex + Simmx$smokeHx + Simmx$dich_Race + Simmx$dx_IPF + Simmx$disadv)
+predicted <- predict(fit1, type="terms", se.fit=T, terms=1)
+
+#Then plot
+plot(Simmx$cg25354716, exp(predicted$fit), type="n", xlim=c(6,8), ylim=c(0.6,1.5))
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit)), col = "red" , lty = 1 )
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit + 1.96 * predicted$se)), col = "orange" , lty = 2 )
+lines(sm.spline(Simmx$cg25354716, exp(predicted$fit - 1.96 * predicted$se)), col = "orange" , lty = 2 )
+```
+
+## Quartiled cg25354716_quart
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart, data=Simm, id=ID)
+summary(coxPH_model1)
+```
+In this unadjusted model, methylation at cg25354716_quart not associated with mortality.
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=Simm, id=ID)
+summary(coxPH_model2)
+```
+**This model indicates that higher methylation of cg25354716 (highest methylation at Q4) is assoc with lower mortality in adjusted models.**
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct, data=Simm, id=ID)
+summary(coxPH_model3)
+```
+This model indicates that higher methylation of cg25354716 is not assoc with lower mortality in adjusted models including baseline FVC and DLCO, indicating that the effect of this locus may be mediated through lung function.
+
+Now I will make a Kaplan-Meier survival curve, discretized by low vs high cg25354716:
+```{r, fig.height=5, fig.width=7}
+surv1 <- survfit(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart, data=Simm)
+(ggsurvplot(surv1, 
+            palette="YlOrRd",
+            censor=TRUE,
+            pval=TRUE,
+            xlim=c(0,10),
+            legend="right",
+           data=Simm,
+           legend.title="cg25354716 Beta Value",
+           legend.labs=c("Q1", "Q2", "Q3", "Q4"),
+           risk.table=T,
+           title="Time to Death or Transplant by cg25354716 Beta-Value",
+           xlab="Time (years)",
+           ylab="Survival Probability (Death or Lung Transplant)",
+           ggtheme = theme_grey()
+           ))
+```
+No clear difference.
+
+## Dichotomized cg25354716_dich
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich, data=Simm, id=ID)
+summary(coxPH_model1)
+```
+In this unadjusted model, methylation at cg25354716_dich not associated with mortality.
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=Simm, id=ID)
+summary(coxPH_model2)
+```
+No sig assoc in this model.
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct, data=Simm, id=ID)
+summary(coxPH_model3)
+```
+
+Now I will make a Kaplan-Meier survival curve, discretized by low vs high cg25354716:
+```{r, fig.height=5, fig.width=7}
+surv1 <- survfit(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich, data=Simm)
+(ggsurvplot(surv1, 
+            palette=c("dodgerblue4","firebrick4"),
+            censor=TRUE,
+            pval=TRUE,
+            xlim=c(0,10),
+            legend="right",
+           data=Simm,
+           legend.title="cg25354716 Beta Value",
+           legend.labs=c("Low", "High"),
+           risk.table=T,
+           title="Time to Death or Transplant by cg25354716 Beta-Value",
+           xlab="Time (years)",
+           ylab="Survival Probability (Death or Lung Transplant)",
+           ggtheme = theme_grey()
+           ))
+```
+No clear difference.
+
+
+# CARE-PF Survival Analysis by cg25354716
+## Continuous cg25354716
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716, data=CARE, id=ID)
+summary(coxPH_model1)
+```
+In this unadjusted model, methylation at cg25354716 not associated with mortality.
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=CARE, id=ID)
+summary(coxPH_model2)
+```
+In this model, methylation at cg25354716 not associated with mortality.
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct, data=CARE, id=ID)
+summary(coxPH_model3)
+```
+In this model, methylation at cg25354716 not associated with mortality.
+
+
+## Dichotomized cg25354716_dich
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich, data=CARE, id=ID)
+summary(coxPH_model1)
+```
+In this unadjusted model, methylation at cg25354716_dich not associated with mortality.
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=CARE, id=ID)
+summary(coxPH_model2)
+```
+In this model, methylation at cg25354716_dich not associated with mortality.
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct, data=CARE, id=ID)
+summary(coxPH_model3)
+```
+In this model, methylation at cg25354716 not associated with mortality.
+
+Now I will make a Kaplan-Meier survival curve, discretized by low vs high cg25354716:
+```{r, fig.height=5, fig.width=7}
+surv1 <- survfit(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich, data=CARE)
+(ggsurvplot(surv1, 
+            palette=c("dodgerblue4","firebrick4"),
+            censor=TRUE,
+            pval=TRUE,
+            xlim=c(0,10),
+            legend="right",
+           data=CARE,
+           legend.title="cg25354716 Beta Value",
+           legend.labs=c("Low", "High"),
+           risk.table=T,
+           title="Time to Death or Transplant by cg25354716 Beta-Value",
+           xlab="Time (years)",
+           ylab="Survival Probability (Death or Lung Transplant)",
+           ggtheme = theme_grey()
+           ))
+```
+No clear difference.
+
+
+# Combined Cohorts Survival Analysis by cg25354716
+## Continuous cg25354716
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1)
+```
+**In this unadjusted model, methylation at cg25354716 associated with lower mortality.**
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2)
+```
+**This model indicates that higher methylation of cg25354716 is assoc with lower mortality in adjusted models.**
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct + cluster(cohort), data=All, id=ID)
+summary(coxPH_model3)
+```
+Inclusion of baseline FVC and DLCO in this model flips the direction of effect.
+
+### Variable HR for cg25354716
+Want a plot with x-axis of All level and y-axis of HR
+
+Unadjusted model
+```{r}
+#First need to make dataframe that only includes patients with time_DeathTxCensor
+Allx <- All %>% filter(!is.na(cg25354716) & !is.na(time_DeathTxCensor))
+
+#Then make survival function
+surv1 <- Surv(Allx$time_DeathTxCensor, Allx$deadORtx==1)
+fit1 <- coxph(surv1 ~ pspline(Allx$cg25354716, df=4) + cluster(Allx$cohort))
+predicted <- predict(fit1, type="terms", se.fit=T, terms=1)
+
+#Then plot
+plot(Allx$cg25354716, exp(predicted$fit), type="n")
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit)), col = "red" , lty = 1 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit + 1.96 * predicted$se)), col = "orange" , lty = 2 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit - 1.96 * predicted$se)), col = "orange" , lty = 2 )
+```
+
+Adjusted model
+```{r}
+#First need to make dataframe that only includes patients with time_DeathTxCensor
+Allx <- All %>% filter(!is.na(cg25354716) & !is.na(time_DeathTxCensor) & !is.na(age_dx) & !is.na(sex) & !is.na(smokeHx) & !is.na(dich_Race) & !is.na(dx_IPF) & !is.na(disadv))
+
+#Then survival function
+surv1 <- Surv(Allx$time_DeathTxCensor, Allx$deadORtx==1)
+fit1 <- coxph(surv1 ~ pspline(Allx$cg25354716, df=4) + Allx$age_dx + Allx$sex + Allx$smokeHx + Allx$dich_Race + Allx$dx_IPF + cluster(Allx$cohort))
+predicted <- predict(fit1, type="terms", se.fit=T, terms=1)
+
+#Then plot
+plot(Allx$cg25354716, exp(predicted$fit), type="n")
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit)), col = "red" , lty = 1 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit + 1.96 * predicted$se)), col = "orange" , lty = 2 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit - 1.96 * predicted$se)), col = "orange" , lty = 2 )
+```
+
+Adjusted model + FVC and DLCO
+```{r}
+#First need to make dataframe that only includes patients with time_DeathTxCensor
+Allx <- All %>% filter(!is.na(cg25354716) & !is.na(time_DeathTxCensor) & !is.na(age_dx) & !is.na(sex) & !is.na(smokeHx) & !is.na(dich_Race) & !is.na(dx_IPF) & !is.na(fvc_pct) & !is.na(dlco_pct))
+
+#Then survival function
+surv1 <- Surv(Allx$time_DeathTxCensor, Allx$deadORtx==1)
+fit1 <- coxph(surv1 ~ pspline(Allx$cg25354716, df=4) + Allx$age_dx + Allx$sex + Allx$smokeHx + Allx$dich_Race + Allx$dx_IPF + Allx$fvc_pct + Allx$dlco_pct + cluster(Allx$cohort))
+predicted <- predict(fit1, type="terms", se.fit=T, terms=1)
+
+#Then plot
+plot(Allx$cg25354716, exp(predicted$fit), type="n")
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit)), col = "red" , lty = 1 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit + 1.96 * predicted$se)), col = "orange" , lty = 2 )
+lines(sm.spline(Allx$cg25354716, exp(predicted$fit - 1.96 * predicted$se)), col = "orange" , lty = 2 )
+```
+
+
+## Quartiled cg25354716_quart
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1)
+```
+**In this unadjusted model, Q2 or DNAm at cg25354716_quart associated increased mortality.**
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2)
+```
+**This model indicates that Q3 and marginally Q4 of cg25354716 assoc with lower mortality in adjusted models.**
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct + cluster(cohort), data=All, id=ID)
+summary(coxPH_model3)
+```
+**This model indicates that higher methylation of cg25354716 is assoc with higher mortality in adjusted models including baseline FVC and DLCO, indicating that the effect of this locus may be mediated through lung function.**
+
+Now I will make a Kaplan-Meier survival curve, discretized by low vs high cg25354716:
+```{r, fig.height=5, fig.width=7}
+surv1 <- survfit(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_quart, data=All)
+(ggsurvplot(surv1, 
+            palette="YlOrRd",
+            censor=TRUE,
+            pval=TRUE,
+            xlim=c(0,10),
+            legend="right",
+           data=All,
+           legend.title="cg25354716 Beta Value",
+           legend.labs=c("Q1", "Q2", "Q3", "Q4"),
+           risk.table=T,
+           title="Time to Death or Transplant by cg25354716 Beta-Value",
+           xlab="Time (years)",
+           ylab="Survival Probability (Death or Lung Transplant)",
+           ggtheme = theme_grey()
+           ))
+```
+No clear difference.
+
+## Dichotomized cg25354716_dich
+Unadjusted model
+```{r}
+coxPH_model1 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1)
+```
+*In this unadjusted model, high methylation at cg25354716_dich is marginally associated with lower mortality.*
+
+Adjusted model
+```{r}
+coxPH_model2 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2)
+```
+**This model indicates that higher methylation of cg25354716 is assoc with lower mortality in adjusted models.**
+
+
+Adjusted model with baseline lung function
+```{r}
+coxPH_model3 <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich + sex + age_dx + smokeHx + dich_Race + dx_IPF  + fvc_pct + dlco_pct + cluster(cohort), data=All, id=ID)
+summary(coxPH_model3)
+```
+**This model indicates that higher methylation of cg25354716 is assoc with higher mortality in adjusted models including baseline FVC and DLCO, indicating that the effect of this locus may be mediated through lung function since the direction of effect flipped.**
+
+Now I will make a Kaplan-Meier survival curve, discretized by low vs high cg25354716:
+```{r, fig.height=5, fig.width=7}
+surv1 <- survfit(Surv(time_DeathTxCensor, deadORtx==1) ~ cg25354716_dich, data=All)
+(ggsurvplot(surv1, 
+            palette=c("dodgerblue4","firebrick4"),
+            censor=TRUE,
+            pval=TRUE,
+            xlim=c(0,10),
+            legend="right",
+           data=All,
+           legend.title="cg25354716 Beta Value",
+           legend.labs=c("Low", "High"),
+           risk.table=T,
+           title="Time to Death or Transplant by cg25354716 Beta-Value",
+           xlab="Time (years)",
+           ylab="Survival Probability (Death or Lung Transplant)",
+           ggtheme = theme_grey()
+           ))
+```
+High methylation curve is slightly higher.
+
+
+# Association between cg25354716 and Baseline FVC
+## Visual EDA
+Scatterplot of cg25354716 beta vs FVC, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=cg25354716, y=fvc_pct, color=sex))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline FVC % Predicted", title="Baseline FVC % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Higher beta-value for cg25354716 appears strongly correlated with higher FVC, moreso in females.
+
+
+Scatterplot of cg25354716 beta vs FVC, with sex represented by the color of points
+```{r}
+(CARE %>% ggplot(aes(x=cg25354716, y=fvc_pct, color=sex))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline FVC % Predicted", title="Baseline FVC % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+No clear correlation between cg25354716 and baseline FVC in CARE-PF cohort
+
+
+Scatterplot of cg25354716 beta vs FVC, with sex represented by the color of points
+```{r}
+(All %>% ggplot(aes(x=cg25354716, y=fvc_pct))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline FVC % Predicted", title="Baseline FVC % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+## Simmons cg25354716 and FVC Models
+Simplest model just looking at cg25354716
+```{r}
+FVC_model1 <- lm(fvc_pct ~ cg25354716, data=Simm)
+summary(FVC_model1)
+confint(FVC_model1)
+```
+**Higher methylation at cg25354716 appears strongly assoc with higher baseline FVC in this model**
+
+Adjusted model
+```{r}
+FVC_model2 <- lm(fvc_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=Simm)
+summary(FVC_model2)
+confint(FVC_model2)
+```
+**Higher methylation at cg25354716 is assoc with higher baseline FVC in this model**
+
+
+## CARE-PF cg25354716 and FVC Models
+Simplest model just looking at cg25354716
+```{r}
+FVC_model1 <- lm(fvc_pct ~ cg25354716, data=CARE)
+summary(FVC_model1)
+confint(FVC_model1)
+```
+Higher methylation at cg25354716 not assoc with higher baseline FVC in this model.
+
+Adjusted model
+```{r}
+FVC_model2 <- lm(fvc_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=CARE)
+summary(FVC_model2)
+confint(FVC_model2)
+```
+Higher methylation at cg25354716 not assoc with higher baseline FVC in this model.
+
+## Combined Cohorts cg25354716 and FVC Models
+Simplest model just looking at cg25354716
+```{r}
+FVC_model1 <- lm(fvc_pct ~ cg25354716 + cluster(cohort), data=All)
+summary(FVC_model1)
+confint(FVC_model1)
+```
+*Higher methylation at cg25354716 marginally assoc with higher baseline FVC in this model*
+
+Adjusted model
+```{r}
+FVC_model2 <- lm(fvc_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All)
+summary(FVC_model2)
+confint(FVC_model2)
+```
+*Higher methylation at cg25354716 marginally assoc with higher baseline FVC in this model*
+
+
+
+
+# Association between cg25354716 and Baseline DLCO
+## Visual EDA
+Scatterplot of cg25354716 beta vs DLCO, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=cg25354716, y=dlco_pct, color=sex))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline DLCO % Predicted", title="Baseline DLCO % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Higher beta-value for cg25354716 appears strongly correlated with higher DLCO
+
+```{r}
+(CARE %>% ggplot(aes(x=cg25354716, y=dlco_pct, color=sex))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline DLCO % Predicted", title="Baseline DLCO % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+No clear correlation between cg25354716 and baseline DLCO in CARE-PF cohort
+
+
+```{r}
+(All %>% ggplot(aes(x=cg25354716, y=dlco_pct))+
+   geom_point()+
+   labs(x="cg25354716 Beta", y="Baseline DLCO % Predicted", title="Baseline DLCO % Predicted by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+## cg25354716 and DLCO Models in Simmons
+Simplest model just looking at cg25354716
+```{r}
+DLCO_model1 <- lm(dlco_pct ~ cg25354716, data=Simm)
+summary(DLCO_model1)
+confint(DLCO_model1)
+```
+**Higher methylation at cg25354716 appears strongly assoc with higher baseline DLCO in this model**
+
+Adjusted model
+```{r}
+DLCO_model2 <- lm(dlco_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=Simm)
+summary(DLCO_model2)
+confint(DLCO_model2)
+```
+**Higher methylation at cg25354716 assoc with higher baseline DLCO in this model**
+
+
+## cg25354716 and DLCO Models in CARE-PF
+Simplest model just looking at cg25354716
+```{r}
+DLCO_model1 <- lm(dlco_pct ~ cg25354716, data=CARE)
+summary(DLCO_model1)
+confint(DLCO_model1)
+```
+Higher methylation at cg25354716 not assoc with baseline DLCO in this model
+
+Adjusted model
+```{r}
+DLCO_model2 <- lm(dlco_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF , data=CARE)
+summary(DLCO_model2)
+confint(DLCO_model2)
+```
+Higher methylation at cg25354716 not assoc with baseline DLCO in this model
+
+
+## Combined Cohorts cg25354716 assoc with DLCO
+Simplest model just looking at cg25354716
+```{r}
+DLCO_model1 <- lm(dlco_pct ~ cg25354716 + cluster(cohort), data=All)
+summary(DLCO_model1)
+confint(DLCO_model1)
+```
+**Higher methylation at cg25354716 assoc with higher baseline DLCO in this model**
+
+Adjusted model
+```{r}
+DLCO_model2 <- lm(dlco_pct ~ cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All)
+summary(DLCO_model2)
+confint(DLCO_model2)
+```
+**Higher methylation at cg25354716 assoc with higher baseline DLCO in this model**
+
+
+
+# Association of Pollutants with cg25354716
+## Make cg25354716 Scale Back to Normal
+```{r}
+Simm$cg25354716 <- (Simm$cg25354716/10)
+CARE$cg25354716 <- (CARE$cg25354716/10)
+All$cg25354716 <- (All$cg25354716/10)
+```
+
+## Visual EDA
+### PM2.5
+Scatterplot of cg25354716 beta vs PM2.5, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=PM_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="PM2.5 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="PM2.5 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with PM2.5 in 5yrs pre-sampling - i.e. as PM2.5 levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=PM_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="PM2.5 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="PM2.5 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+No clear correlation between cg25354716 and PM2.5 in 5yrs pre-sampling in CARE-PF cohort
+
+
+```{r}
+(All %>% ggplot(aes(x=PM_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="PM2.5 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="PM2.5 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+### SO4
+Scatterplot of cg25354716 beta vs SO4, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=SO4_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="SO4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SO4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with SO4 in 5yrs pre-sampling - i.e. as SO4 levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=SO4_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="SO4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SO4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and SO4 in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=SO4_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="SO4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SO4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### NO3
+Scatterplot of cg25354716 beta vs NO3, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=NO3_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="NO3 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NO3 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with NO3 in 5yrs pre-sampling - i.e. as NO3 levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=NO3_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="NO3 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NO3 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and NO3 in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=NO3_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="NO3 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NO3 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### NH4
+Scatterplot of cg25354716 beta vs NH4, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=NH4_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="NH4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NH4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with NH4 in 5yrs pre-sampling - i.e. as NH4 levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=NH4_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="NH4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NH4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and NH4 in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=NH4_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="NH4 in 5yrs Pre-Sampling", y="cg25354716 Beta", title="NH4 in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### BC
+Scatterplot of cg25354716 beta vs BC, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=BC_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="BC in 5yrs Pre-Sampling", y="cg25354716 Beta", title="BC in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with BC in 5yrs pre-sampling - i.e. as BC levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=BC_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="BC in 5yrs Pre-Sampling", y="cg25354716 Beta", title="BC in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and BC in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=BC_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="BC in 5yrs Pre-Sampling", y="cg25354716 Beta", title="BC in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### OM
+Scatterplot of cg25354716 beta vs OM, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=OM_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="OM in 5yrs Pre-Sampling", y="cg25354716 Beta", title="OM in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with OM in 5yrs pre-sampling - i.e. as OM levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=OM_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="OM in 5yrs Pre-Sampling", y="cg25354716 Beta", title="OM in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and OM in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=OM_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="OM in 5yrs Pre-Sampling", y="cg25354716 Beta", title="OM in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### SS
+Scatterplot of cg25354716 beta vs SS, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=SS_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="SS in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SS in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with SS in 5yrs pre-sampling - i.e. as SS levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=SS_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="SS in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SS in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and SS in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=SS_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="SS in 5yrs Pre-Sampling", y="cg25354716 Beta", title="SS in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+### Soil
+Scatterplot of cg25354716 beta vs Soil, with sex represented by the color of points
+```{r}
+(Simm %>% ggplot(aes(x=Soil_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="Soil in 5yrs Pre-Sampling", y="cg25354716 Beta", title="Soil in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+Beta-value at cg25354716 appears strongly anti-correlated with Soil in 5yrs pre-sampling - i.e. as Soil levels increase, cg25354716 beta-values decrease
+
+```{r}
+(CARE %>% ggplot(aes(x=Soil_5yrPreSamp, y=cg25354716, color=sex))+
+   geom_point()+
+   labs(x="Soil in 5yrs Pre-Sampling", y="cg25354716 Beta", title="Soil in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+There appears to be a slight anti-correlation between cg25354716 and Soil in 5yrs pre-sampling in CARE-PF cohort, but not as pronounced as in Simmons
+
+```{r}
+(All %>% ggplot(aes(x=Soil_5yrPreSamp, y=cg25354716, color=cohort))+
+   geom_point(alpha=0.4)+
+   labs(x="Soil in 5yrs Pre-Sampling", y="cg25354716 Beta", title="Soil in 5yrs Pre-Sampling by cg25354716 Beta Value")+
+   geom_smooth(method="lm", se = FALSE) +
+   theme_light()+
+   scale_color_manual(values=c("red","gold1"))+
+   theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+
+## Beta Regression Models for PM2.5 assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ PM_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**PM_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ PM_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**PM_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ PM_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+PM_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ PM_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+PM_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ PM_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**PM_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ PM_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**PM_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for SO4 assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SO4_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**SO4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SO4_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**SO4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SO4_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+SO4_5yrPreSamp is not assoc with methylation at this locus in CARE models, although direction of effect is consistent.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SO4_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+SO4_5yrPreSamp is not assoc with methylation at this locus in CARE models, although it nears significance.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SO4_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**SO4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SO4_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**SO4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for NO3 assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NO3_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**NO3_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NO3_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+*NO3_5yrPreSamp is marginally assoc with lower methylation at this locus.*
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NO3_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+NO3_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NO3_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+NO3_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NO3_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**NO3_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NO3_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**NO3_5yrPreSamp is assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for NH4 assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NH4_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**NH4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NH4_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**NH4_5yrPreSamp is highly assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NH4_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+NH4_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NH4_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+NH4_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ NH4_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**NH4_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ NH4_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**NH4_5yrPreSamp is assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for BC assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ BC_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**BC_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ BC_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**BC_5yrPreSamp is assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ BC_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+BC_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ BC_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+BC_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ BC_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**BC_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ BC_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**BC_5yrPreSamp is assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for OM assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ OM_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**OM_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ OM_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**OM_5yrPreSamp is assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ OM_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+OM_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ OM_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+OM_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ OM_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**OM_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ OM_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**OM_5yrPreSamp is assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for SS assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SS_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**SS_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SS_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**SS_5yrPreSamp is assoc with lower methylation at this locus.**
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SS_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+SS_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SS_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+SS_5yrPreSamp is not assoc with lower methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ SS_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+**SS_5yrPreSamp is assoc with lower methylation at this locus.**
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ SS_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+**SS_5yrPreSamp is assoc with lower methylation at this locus.**
+
+
+
+## Beta Regression Models for Soil assoc with cg25354716 Beta-Value
+### Simmons
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ Soil_5yrPreSamp, data=Simm)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+*Soil_5yrPreSamp is marginally assoc with lower methylation at this locus.*
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ Soil_5yrPreSamp + dich_Race , data=Simm)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+Soil_5yrPreSamp is not assoc with lower methylation at this locus.
+
+### CARE
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ Soil_5yrPreSamp, data=CARE)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+Soil_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ Soil_5yrPreSamp + dich_Race , data=CARE)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+Soil_5yrPreSamp is not assoc with methylation at this locus in CARE models.
+
+### Combined Cohorts
+```{r}
+CpG_model1 <- betareg(cg25354716 ~ Soil_5yrPreSamp + cluster(cohort), data=All)
+summary(CpG_model1)
+confint(CpG_model1)
+```
+*Soil_5yrPreSamp is marginally assoc with lower methylation at this locus.*
+
+```{r}
+CpG_model2 <- betareg(cg25354716 ~ Soil_5yrPreSamp + dich_Race + cluster(cohort), data=All)
+summary(CpG_model2)
+confint(CpG_model2)
+```
+*Soil_5yrPreSamp is marginally assoc with lower methylation at this locus.*
+
+
+## Non-Linear Generalized Additive Models for pollutant associations with cg25354716
+### PM2.5
+```{r}
+# Load necessary packages
+library(mgcv)
+
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(PM_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+Plot is somewhat non-linear with a steeper slope around ~8ug/m3 of PM2.5, which may explain some of the lack of effect in the UBC cohort
+
+### SO4
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(SO4_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+edf=1.002 means essentially a linear relationship, but the very significant p-value indicates SO4 has a strong effect on cg25354716 DNAm
+
+### NO3
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(NO3_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+edf=1.002 means essentially a linear relationship, but the p-value indicates NO3 has an effect on cg25354716 DNAm
+
+### NH4
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(NH4_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+edf=1.001 means essentially a linear relationship, but the very significant p-value indicates NH4 has a strong effect on cg25354716 DNAm
+
+### BC
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(BC_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+Marginal effect here of BC on cg25354716 DNAm with edf=1.7 indicating potential non-linearity
+
+### OM
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(OM_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+OM has a significant association with cg25354716 methylation and edf=2.85 indicates non-linearity in that effect
+
+### SS
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(SS_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+OM has a significant association with cg25354716 methylation and edf=2.42 indicates non-linearity in that effect
+
+### Soil
+```{r}
+# Fit a GAM model
+CpG_gam <- gam(cg25354716 ~ s(Soil_5yrPreSamp) + dich_Race + cluster(cohort), family=betar(), data=All)
+
+# Check the model summary
+summary(CpG_gam)
+
+# Plot the smooth term
+plot(CpG_gam, select=1, shade=TRUE)
+```
+No sig assoc of soil with cg25354716 methylation in this model
+
+
+# Pollutant Associations with Mortality & Mediation by cg25354716
+## PM2.5 in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+**PM2.5 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the PM_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["PM_5yrPreSamp"])/(coxPH_model1a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+**PM2.5 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the PM_5yrPreSamp HR, suggesting that aa portion of the effect of PM2.5 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["PM_5yrPreSamp"])/(coxPH_model2a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~9% of the association of PM2.5 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - PM2.5 Simmons
+```{r}
+cgmed_model1 <- lm(cg25354716 ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="PM_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+This indicates that ~7% of the PM2.5 assoc with mortality is mediated through cg25354716, but this effect is not significant
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+PM2.5 in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 decreases the PM_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["PM_5yrPreSamp"])/(coxPH_model1a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+PM2.5 in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx + cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the PM_5yrPreSamp HR, but not significant analysis
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["PM_5yrPreSamp"])/(coxPH_model2a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**PM2.5 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the PM_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["PM_5yrPreSamp"])/(coxPH_model1a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**PM2.5 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the PM_5yrPreSamp HR, suggesting that aa portion of the effect of PM2.5 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["PM_5yrPreSamp"])/(coxPH_model2a$coefficients["PM_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~2% of the association of PM2.5 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - PM2.5 Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ PM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ PM_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="PM_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+**This indicates that ~4% of the PM2.5 assoc with mortality is mediated through cg25354716, and this effect is significant.**
+
+
+
+## SO4 in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+**SO4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the SO4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SO4_5yrPreSamp"])/(coxPH_model1a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+**SO4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx + cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the SO4_5yrPreSamp HR, suggesting that a portion of the effect of SO4 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SO4_5yrPreSamp"])/(coxPH_model2a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~4% of the association of SO4 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - SO4 Simmons
+```{r}
+cgmed_model1 <- lm(cg25354716 ~ SO4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="SO4_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+This indicates that ~3% of the SO4 assoc with mortality is mediated through cg25354716, but this effect is not significant.
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+SO4 in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 decreases the SO4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SO4_5yrPreSamp"])/(coxPH_model1a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+SO4 in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the SO4_5yrPreSamp HR, but not significant analysis
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SO4_5yrPreSamp"])/(coxPH_model2a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**SO4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the SO4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SO4_5yrPreSamp"])/(coxPH_model1a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**SO4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the SO4_5yrPreSamp HR, suggesting that aa portion of the effect of SO4 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SO4_5yrPreSamp"])/(coxPH_model2a$coefficients["SO4_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~1% of the association of SO4 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - SO4 Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ SO4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ SO4_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="SO4_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+**This indicates that ~3% of the SO4 assoc with mortality is mediated through cg25354716, and this effect is significant.**
+
+
+
+
+
+## NO3 in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+NO3 in 5yrs pre-sampling not associated with mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+NO3 in 5yrs pre-sampling not associated with mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NO3_5yrPreSamp"])/(coxPH_model1a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+Can't rely on mediation proportion as neither preceding analyses significant.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+NO3 in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the NO3_5yrPreSamp HR, but still not significant
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NO3_5yrPreSamp"])/(coxPH_model2a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+Can't rely on this number as not significant analyses
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+NO3 in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 decreases the NO3_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NO3_5yrPreSamp"])/(coxPH_model1a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+Can't rely on this mediation proportion as neither preceding analysis significant.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+NO3 in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the NO3_5yrPreSamp HR, but not significant analysis
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NO3_5yrPreSamp"])/(coxPH_model2a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+Can't rely on this mediation proportion as neither preceding analysis significant.
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**NO3 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually doesnt change the NO3_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NO3_5yrPreSamp"])/(coxPH_model1a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**NO3 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the NO3_5yrPreSamp HR, suggesting that aa portion of the effect of NO3 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NO3_5yrPreSamp"])/(coxPH_model2a$coefficients["NO3_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~2% of the association of NO3 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - NO3 Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ NO3_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ NO3_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="NO3_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+*This indicates that ~4% of the NO3 assoc with mortality is mediated through cg25354716, and this effect is marginal.*
+
+
+
+
+
+
+## NH4 in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+**NH4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the NH4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NH4_5yrPreSamp"])/(coxPH_model1a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+**NH4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the NH4_5yrPreSamp HR, suggesting that aa portion of the effect of NH4 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NH4_5yrPreSamp"])/(coxPH_model2a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~9% of the association of NH4 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - NH4 Simmons
+```{r}
+cgmed_model1 <- lm(cg25354716 ~ NH4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="NH4_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+This indicates that ~7% of the NH4 assoc with mortality is mediated through cg25354716, but this effect is not significant.
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+**NH4 in 5yrs pre-sampling associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 increases the NH4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NH4_5yrPreSamp"])/(coxPH_model1a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+No mediation in unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+**NH4 in 5yrs pre-sampling marginally associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NH4_5yrPreSamp"])/(coxPH_model2a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in this model.
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**NH4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the NH4_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["NH4_5yrPreSamp"])/(coxPH_model1a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**NH4 in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the NH4_5yrPreSamp HR, suggesting that aa portion of the effect of NH4 in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["NH4_5yrPreSamp"])/(coxPH_model2a$coefficients["NH4_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~2% of the association of NH4 with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - NH4 Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ NH4_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ NH4_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="NH4_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+**This indicates that ~4% of the NH4 assoc with mortality is mediated through cg25354716, and this effect is significant.**
+
+
+
+
+
+
+## BC in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["BC_5yrPreSamp"])/(coxPH_model1a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+Can't interpret as previous analyses not significant.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["BC_5yrPreSamp"])/(coxPH_model2a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant, so can't rely on this proportion
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["BC_5yrPreSamp"])/(coxPH_model1a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant so can't rely on this proportion.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+BC in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+BC in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["BC_5yrPreSamp"])/(coxPH_model2a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**BC in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually does not largely change the BC_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["BC_5yrPreSamp"])/(coxPH_model1a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is 0.2% mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**BC in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the BC_5yrPreSamp HR, suggesting that aa portion of the effect of BC in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["BC_5yrPreSamp"])/(coxPH_model2a$coefficients["BC_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~1% of the association of BC with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - BC Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ BC_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ BC_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="BC_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+*This indicates that ~5% of the BC assoc with mortality is mediated through cg25354716, and this effect is marginal.*
+
+
+
+
+
+## OM in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["OM_5yrPreSamp"])/(coxPH_model1a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+Neither preceding model significant so can't rely on this proportion.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["OM_5yrPreSamp"])/(coxPH_model2a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant so can't rely on this proportion
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["OM_5yrPreSamp"])/(coxPH_model1a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant so can't rely on mediation proportion.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+OM in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+OM in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["OM_5yrPreSamp"])/(coxPH_model2a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**OM in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 doesn't change the OM_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["OM_5yrPreSamp"])/(coxPH_model1a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is 1% mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**OM in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the OM_5yrPreSamp HR, suggesting that aa portion of the effect of OM in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["OM_5yrPreSamp"])/(coxPH_model2a$coefficients["OM_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~6% of the association of OM with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - OM Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ OM_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ OM_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="OM_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+This indicates that ~6% of the OM assoc with mortality is mediated through cg25354716, and this effect is not significant.
+
+
+
+
+
+
+## SS in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+**SS in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 actually increases the SS_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SS_5yrPreSamp"])/(coxPH_model1a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+**SS in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the SS_5yrPreSamp HR, suggesting that a portion of the effect of SS in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SS_5yrPreSamp"])/(coxPH_model2a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~11% of the association of SS with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+
+
+### Causal Mediation Analysis - SS Simmons
+```{r}
+cgmed_model1 <- lm(cg25354716 ~ SS_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF, data=Simm)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="SS_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+16% mediation but not significant.
+
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+SS in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 increases the SS_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SS_5yrPreSamp"])/(coxPH_model1a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+Neither analysis significant so can't rely on the mediation proportion in this analysis.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+SS in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the SS_5yrPreSamp HR, but not significant analysis
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SS_5yrPreSamp"])/(coxPH_model2a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+SS in 5yrs pre-sampling is not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 decreases the SS_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["SS_5yrPreSamp"])/(coxPH_model1a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+Can't interpret as previous analyses not significant.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+SS in 5yrs pre-sampling is not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ SS_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["SS_5yrPreSamp"])/(coxPH_model2a$coefficients["SS_5yrPreSamp"])))
+med_prop
+```
+Not interpretable
+ 
+
+## Soil in 5yrs Pre-Sampling
+### Simmons
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp, data=Simm, id=ID)
+summary(coxPH_model1a)
+```
+Soil in 5yrs pre-sampling not associated with mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + cg25354716, data=Simm, id=ID)
+summary(coxPH_model1b)
+```
+Soil in 5yrs pre-sampling not associated with mortality in this model.
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["Soil_5yrPreSamp"])/(coxPH_model1a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+Neither preceding model significant so can't rely on this mediation proportion.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=Simm, id=ID)
+summary(coxPH_model2a)
+```
+Soil in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=Simm, id=ID)
+summary(coxPH_model2b)
+```
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["Soil_5yrPreSamp"])/(coxPH_model2a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant, so can't interpret
+
+### CARE
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp, data=CARE, id=ID)
+summary(coxPH_model1a)
+```
+Soil in 5yrs pre-sampling not associated with increased mortality in this model.
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + cg25354716, data=CARE, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 decreases the Soil_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["Soil_5yrPreSamp"])/(coxPH_model1a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+Neither preceding analysis significant, so can't rely on this mediation proportion.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx, data=CARE, id=ID)
+summary(coxPH_model2a)
+```
+Soil in 5yrs pre-sampling not associated with mortality in this model.
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + dich_Race + age_dx + dx_IPF + smokeHx+ cg25354716, data=CARE, id=ID)
+summary(coxPH_model2b)
+```
+Including cg25354716 in this model decreases the Soil_5yrPreSamp HR, but not significant analysis
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["Soil_5yrPreSamp"])/(coxPH_model2a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+Neither analyses are significant in the CARE-PF models, so can't rely much on this mediation proportion.
+
+
+
+### Combined Cohorts
+Unadjusted model
+```{r}
+coxPH_model1a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + cluster(cohort), data=All, id=ID)
+summary(coxPH_model1a)
+```
+**Soil in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Unadjusted model + cg25354716
+```{r}
+coxPH_model1b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model1b)
+```
+Including cg25354716 doesnt change the Soil_5yrPreSamp HR
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model1b$coefficients["Soil_5yrPreSamp"])/(coxPH_model1a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+This indicates that there is no mediation in the unadjusted model.
+
+Adjusted model
+```{r}
+coxPH_model2a <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=All, id=ID)
+summary(coxPH_model2a)
+```
+**Soil in 5yrs pre-sampling is associated with increased mortality in this model.**
+
+Adjusted model + cg25354716
+```{r}
+coxPH_model2b <- coxph(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort) + cg25354716, data=All, id=ID)
+summary(coxPH_model2b)
+```
+**Including cg25354716 in this model decreases the Soil_5yrPreSamp HR, suggesting that aa portion of the effect of Soil in 5yrs pre-sampling on mortality is mediated through methylation at cg25354716.**
+
+Mediation analysis
+```{r}
+med_prop <- (1-((coxPH_model2b$coefficients["Soil_5yrPreSamp"])/(coxPH_model2a$coefficients["Soil_5yrPreSamp"])))
+med_prop
+```
+This indicates that ~1% of the association of Soil with mortality may be mediated by beta value at cg25354716 in these adjusted models.
+
+### Causal Mediation Analysis - Soil Combined Cohorts
+```{r}
+Allx <- All %>% filter(!is.na(time_DeathTxCensor))
+cgmed_model1 <- lm(cg25354716 ~ Soil_5yrPreSamp + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(cgmed_model1)
+confint(cgmed_model1)
+```
+
+```{r}
+med_model1 <- survreg(Surv(time_DeathTxCensor, deadORtx==1) ~ Soil_5yrPreSamp + cg25354716 + sex + age_dx + smokeHx + dich_Race + dx_IPF + cluster(cohort), data=Allx)
+summary(med_model1)
+```
+
+
+```{r}
+set.seed(100)
+med1 <- mediation::mediate(cgmed_model1, med_model1, treat="Soil_5yrPreSamp", mediator="cg25354716")
+summary(med1)
+```
+This indicates that ~3% of the Soil assoc with mortality is mediated through cg25354716, and this effect is not significant.
+
+
+
+
+
+
+
