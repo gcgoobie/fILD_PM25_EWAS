@@ -1,0 +1,4 @@
+The files included in this repository reflect the DNA methylation (DNAm) filtering, normalization, and processing from a epigenome-wide analysis of 476 blood samples from patients with various forms of fibrotic interstitial lung disease (fILD) from the University of Pittsburgh (UPitt) and University of British Columbia (UBC) fILD cohorts. 
+DNAm was performed using the Illumina MethylationEPIC Beadchip array.
+Patient residential location was matched based on latitude and longitude coordinates to PM2.5 and constituent estimates from the Atmospheric Composition Analysis Group hybrid satellite PM2.5 data accessed from https://sites.wustl.edu/acag/datasets/surface-pm2-5/. 
+An epigenome-wide association study (EWAS) was performed evaluating the association of increasing PM2.5 and constituent exposures with differential blood DNAm in patients with fILD.
