@@ -1,0 +1,390 @@
+---
+title: "Multi-Package DNAm Analysis Workflow"
+author: "Gillian Goobie"
+date: "08/22/2022"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+  bookdown::html_document2:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=F}
+library(tidyverse)
+library(readxl)
+library(sesame)
+library(sesameData)
+library(parallel)
+library(here)
+library(SummarizedExperiment)
+library(knitr)
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(writexl)
+```
+
+# Load the required files
+## Load the EPIC annotation
+```{r}
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+head(anno)
+```
+
+
+## Load the sample sheet
+```{r}
+dataDirectory <- "/ihome/zhang3/gcg15/DNAmEPIC"
+
+targets <- read.metharray.sheet(dataDirectory, pattern="FullCohort_CombinedSampleSheets_2022_08_22.csv")
+targets
+```
+
+# Remove the two duplicate samples
+```{r}
+targets <- targets %>% filter(Sample_Name!="206139130021_R02C01" & Sample_Name!="206139120085_R07C01")
+str(targets)
+```
+This takes us down to 478 unique samples.
+
+
+# Read IDAT data
+```{r, message=F}
+rgSet <- read.metharray.exp(targets=targets)
+rgSet
+```
+
+## Give the samples correct naems
+```{r}
+targets$ID <- paste(targets$Sample_Group,targets$Sample_Name,sep=".")
+sampleNames(rgSet) <- targets$ID
+rgSet
+```
+
+
+# Quality Control
+## Detection P-values
+```{r}
+detP <- detectionP(rgSet)
+head(detP)
+```
+
+## Identify failed samples by detection p-values
+```{r}
+pal <- brewer.pal(8,"Dark2")
+par(mfrow=c(1,2))
+barplot(colMeans(detP), col=pal[factor(targets$Sample_Group)], las=2, 
+        cex.names=0.8, ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$Sample_Group)), fill=pal,
+       bg="white")
+
+barplot(colMeans(detP), col=pal[factor(targets$Sample_Group)], las=2, 
+        cex.names=0.8, ylim=c(0,0.002), ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$Sample_Group)), fill=pal, 
+       bg="white")
+```
+
+
+How many samples have mean detP >0.05?
+```{r}
+poor <-  colMeans(detP) >0.05
+sum(poor)
+```
+There are two samples whose mean detP is >0.05 that will need to be removed.
+
+## Generate QC report
+This step will produce a PDF of several QC plots (see page 12-14 here: https://bioconductor.org/help/course-materials/2014/BioC2014/minfi_BioC2014.pdf), including:
+-plotQC() will plot methylated median intensity vs unmethylated median intensity, with a plot that highlights bad samples
+-densityPlot() will look @ beta value densities of the samples, and you can color the densities by sample group (e.g. cohort), where you expect to have most of the beta values clustering around 0 or 1
+-densityBeanPlot() is similar to densityPlot, but has different row for each sample
+-controlStripPlot() can assess the quality of sample preparation steps
+```{r}
+qcReport(rgSet, sampNames=targets$ID, sampGroups=targets$Sample_Group, pdf="qcReport.pdf")
+```
+Can look at these plots and decide whether there are any samples that need to be removed
+
+# Remove poor quality samples
+Need to remove any samples where the mean detection p-value across all probes is >0.05, because this indicates poor sample quality.
+```{r}
+keep <- colMeans(detP) <0.05
+rgSet <- rgSet[,keep]
+rgSet
+```
+Down to 476 samples now
+
+Need to also remove these samples from the targets data
+```{r}
+targets <- targets[keep,]
+```
+
+And from the detP dataframe
+```{r}
+detP <- detP[,keep]
+dim(detP)
+```
+
+# Normalization
+Choosing to use the preprocessQuantile method because we are not comparing multiple tissue types, so we do not anticipate major global differences between our samples (Fortin et al. Genome Biology 2014, 15:503)
+```{r}
+mSetSq <- preprocessQuantile(rgSet) 
+```
+
+```{r}
+# create a MethylSet object from the raw data for plotting
+mSetRaw <- preprocessRaw(rgSet)
+```
+
+Visualize before and after normalization 
+```{r}
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=targets$Sample_Group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=targets$Sample_Group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+Plots look much better after normalization, although there is still one Simmons sample that is a bit wonky.
+
+# Exploratory Data Visualization
+```{r}
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)])
+legend("top", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       bg="white", cex=0.7)
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common",  
+        col=pal[factor(targets$Sample_Plate)])
+legend("top", legend=levels(factor(targets$Sample_Plate)), text.col=pal,
+       bg="white", cex=0.7)
+```
+Hard to gain anything from these plots with the large IDs
+
+
+# Filtering Probes Prior to Differential Methylation Analysis
+Make sure probes are in the same order between mSetSq and detP
+```{r}
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+```
+
+## Remove failed probes
+Remove any probes that failed in one or more samples
+```{r}
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+```
+So we will lose 142,052 probes, leaving analysis on 723,807
+
+
+```{r}
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+```
+
+## Remove sex chromosome probes
+```{r}
+keep <- !(featureNames(mSetSqFlt) %in% anno$Name[anno$chr %in% 
+                                                        c("chrX","chrY")])
+table(keep)
+mSetSqFlt <- mSetSqFlt[keep,]
+```
+There are 15,656 probes that are on the sex chromosomes, so will get rid of those
+
+## Remove probes with SNPs at CpG site
+```{r}
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+```
+This takes us down to 685,401 CpGs
+
+## Remove cross-reactive probes
+Will remove probes that map to multiple locations on the genome. Cross-hybridizing probes list for EPIC array was acquired from Supplemental table 2 of McCartney et al; Genom Data 2016; 9:22-24. This manuscript is accessed at: https://www.ncbi.nlm.nih.gov/SO4c/articles/SO4C4909830/ 
+```{r}
+outfile1 <- here("DNAmEPIC_CrossHybridizingProbes_2022_08_23.xlsx")
+xReactiveProbes <- read_excel(outfile1)
+```
+
+Get rid of probes that have been previously shown to be cross-reactive
+```{r}
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+table(keep)
+```
+there are 36,348 probes we need to get rid of
+
+```{r}
+mSetSqFlt <- mSetSqFlt[keep,] 
+mSetSqFlt
+```
+So after all our filtering steps, we have 649,053 probes and 476 samples that pass our QC pipeline
+
+# Calculate M-Values and Beta-Values
+## M-Values
+```{r}
+mVals <- getM(mSetSqFlt)
+head(mVals[,1:5])
+```
+
+## Beta Values
+```{r}
+bVals <- getBeta(mSetSqFlt)
+head(bVals[,1:5])
+dim(bVals)
+```
+You can see we have 476 samples and 649,053 probes that have passed our filtering steps
+
+## Plotting M- and Beta-Values
+```{r}
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targets$Sample_Group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(mVals, sampGroups=targets$Sample_Group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+Both look good with the exception of one sample that is a bit wonky again.
+
+
+# Global DNAm
+## Get Average Beta Value Across All Viable CpGs 
+```{r}
+avgB <- colMeans(bVals)
+avgB <- cbind(colnames(bVals), avgB)
+avgB <- as.data.frame(avgB)
+
+#change the rownames from the EPIC_ID to just 1:476
+rownames <- 1:476
+rownames(avgB) <-  rownames
+```
+
+Rename first column
+```{r}
+str(avgB)
+avgB <- avgB %>% rename("V1"="EPIC_ID")
+```
+
+Split EPIC_ID into two columns
+```{r}
+avgB <- avgB %>% separate(EPIC_ID, into=c("cohort","EPIC_ID"), extra="merge")
+```
+
+
+## Uploading Meta-Data
+```{r}
+outfile2 <- here("FullCohort_IDsANDcovariates_2022_08_22.xlsx")
+meta <- read_excel(outfile2, na="")
+```
+
+## Releveling factor variables in meta
+```{r}
+meta$EPIC_ID <- as.factor(meta$EPIC_ID)
+meta$sex <- fct_relevel(meta$sex, c("M","F"))
+meta$cohort <- fct_relevel(meta$cohort, c("Simmons","CARE"))
+meta$race <- fct_relevel(meta$race, c("W","B","A","U"))
+meta$dich_Race <- fct_relevel(meta$dich_Race, c("White","Non-White"))
+meta$smokeHx <- fct_relevel(meta$smokeHx, c("Never","Former","Always","Unknown"))
+
+meta$dx <- fct_relevel(meta$dx, c("IPF"))
+meta$dx_group <- fct_relevel(meta$dx_group, c("IPF"))
+meta$dx_IPF <- fct_relevel(meta$dx_IPF, c("IPF"))
+meta$PM5yrSamp_dich <- fct_relevel(meta$PM5yrSamp_dich, c("Low"))
+meta$PM1yrSamp_dich <- fct_relevel(meta$PM1yrSamp_dich, c("Low"))
+meta$PM6moSamp_dich <- fct_relevel(meta$PM6moSamp_dich, c("Low"))
+meta$PM3moSamp_dich <- fct_relevel(meta$PM3moSamp_dich, c("Low"))
+meta$PM1moSamp_dich <- fct_relevel(meta$PM1moSamp_dich, c("Low"))
+meta$SO45yrSamp_dich <- fct_relevel(meta$SO45yrSamp_dich, c("Low"))
+meta$SO41yrSamp_dich <- fct_relevel(meta$SO41yrSamp_dich, c("Low"))
+meta$SO46moSamp_dich <- fct_relevel(meta$SO46moSamp_dich, c("Low"))
+meta$SO43moSamp_dich <- fct_relevel(meta$SO43moSamp_dich, c("Low"))
+meta$SO41moSamp_dich <- fct_relevel(meta$SO41moSamp_dich, c("Low"))
+meta$NO35yrSamp_dich <- fct_relevel(meta$NO35yrSamp_dich, c("Low"))
+meta$NO31yrSamp_dich <- fct_relevel(meta$NO31yrSamp_dich, c("Low"))
+meta$NO36moSamp_dich <- fct_relevel(meta$NO36moSamp_dich, c("Low"))
+meta$NO33moSamp_dich <- fct_relevel(meta$NO33moSamp_dich, c("Low"))
+meta$NO31moSamp_dich <- fct_relevel(meta$NO31moSamp_dich, c("Low"))
+meta$NH45yrSamp_dich <- fct_relevel(meta$NH45yrSamp_dich, c("Low"))
+meta$NH41yrSamp_dich <- fct_relevel(meta$NH41yrSamp_dich, c("Low"))
+meta$NH46moSamp_dich <- fct_relevel(meta$NH46moSamp_dich, c("Low"))
+meta$NH43moSamp_dich <- fct_relevel(meta$NH43moSamp_dich, c("Low"))
+meta$NH41moSamp_dich <- fct_relevel(meta$NH41moSamp_dich, c("Low"))
+meta$BC5yrSamp_dich <- fct_relevel(meta$BC5yrSamp_dich, c("Low"))
+meta$BC1yrSamp_dich <- fct_relevel(meta$BC1yrSamp_dich, c("Low"))
+meta$BC6moSamp_dich <- fct_relevel(meta$BC6moSamp_dich, c("Low"))
+meta$BC3moSamp_dich <- fct_relevel(meta$BC3moSamp_dich, c("Low"))
+meta$BC1moSamp_dich <- fct_relevel(meta$BC1moSamp_dich, c("Low"))
+meta$OM5yrSamp_dich <- fct_relevel(meta$OM5yrSamp_dich, c("Low"))
+meta$OM1yrSamp_dich <- fct_relevel(meta$OM1yrSamp_dich, c("Low"))
+meta$OM6moSamp_dich <- fct_relevel(meta$OM6moSamp_dich, c("Low"))
+meta$OM3moSamp_dich <- fct_relevel(meta$OM3moSamp_dich, c("Low"))
+meta$OM1moSamp_dich <- fct_relevel(meta$OM1moSamp_dich, c("Low"))
+meta$SS5yrSamp_dich <- fct_relevel(meta$SS5yrSamp_dich, c("Low"))
+meta$SS1yrSamp_dich <- fct_relevel(meta$SS1yrSamp_dich, c("Low"))
+meta$SS6moSamp_dich <- fct_relevel(meta$SS6moSamp_dich, c("Low"))
+meta$SS3moSamp_dich <- fct_relevel(meta$SS3moSamp_dich, c("Low"))
+meta$SS1moSamp_dich <- fct_relevel(meta$SS1moSamp_dich, c("Low"))
+meta$Soil5yrSamp_dich <- fct_relevel(meta$Soil5yrSamp_dich, c("Low"))
+meta$Soil1yrSamp_dich <- fct_relevel(meta$Soil1yrSamp_dich, c("Low"))
+meta$Soil6moSamp_dich <- fct_relevel(meta$Soil6moSamp_dich, c("Low"))
+meta$Soil3moSamp_dich <- fct_relevel(meta$Soil3moSamp_dich, c("Low"))
+meta$Soil1moSamp_dich <- fct_relevel(meta$Soil1moSamp_dich, c("Low"))
+str(meta)
+```
+
+## Convert Date Columns to Date Format
+Next I need to convert all date columns to proper format
+```{r}
+meta <- meta %>% 
+  mutate_at(c("sample_date", "PM_date"), as.Date)
+```
+
+## Remove the two poor quality samples from meta
+```{r}
+poor_samples <- anti_join(meta, targets, by=c("EPIC_ID"="Sample_Name"))
+poor_samples$EPIC_ID
+meta <- meta %>% filter(EPIC_ID!="206139120114_R01C01" & EPIC_ID!="206137500047_R07C01")
+```
+
+## Merge avgB and meta
+```{r}
+avgB <- left_join(avgB, meta, by=c("EPIC_ID", "cohort"))
+avgB <- avgB %>% dplyr::select(EPIC_ID, ID, StudyCode, everything(.))
+```
+
+## Extract avgB in Excel for Analysis in Separate .Rmd  
+```{r}
+write_xlsx(avgB, "FullCohort_BaselineData_AND_AvgBetas_2022_08_24.xlsx")
+```
+
+
+# Save list of objects in environment
+```{r}
+# start by removing objects i dont need
+rm(anno, avgB, mSetRaw, mSetSq, rgSet, xReactiveProbes, cols, dataDirectory, individual, keep, poor, poor_samples, rownames)
+
+# now save the environment image
+save.image(file="DNAmEPIC_Environment.RData")
+```
+
